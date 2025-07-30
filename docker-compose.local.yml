@@ -1,0 +1,118 @@
+services:
+  # PostgreSQL 데이터베이스
+  postgres:
+    image: postgres:17-alpine
+    container_name: mcp-postgres
+    environment:
+      POSTGRES_USER: mcp_user
+      POSTGRES_PASSWORD: mcp_password
+      POSTGRES_DB: mcp_retriever
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - mcp-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mcp_user -d mcp_retriever"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Qdrant 벡터 데이터베이스
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: mcp-qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    environment:
+      QDRANT__SERVICE__GRPC_PORT: 6334
+    networks:
+      - mcp-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6333/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis 캐시
+  redis:
+    image: redis:latest
+    container_name: mcp-redis
+    command: redis-server --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - mcp-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # 인증 게이트웨이
+  auth-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile.auth
+    container_name: mcp-auth-gateway
+    environment:
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY:-your-secret-key-change-in-production}
+      - MCP_SERVER_URL=http://mcp-server:8001
+      - DATABASE_URL=sqlite+aiosqlite:///./auth.db
+      - LOG_LEVEL=INFO
+    ports:
+      - "8000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - mcp-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # MCP 서버 (HTTP 모드로 실행)
+  mcp-server:
+    build:
+      context: .
+      dockerfile: Dockerfile.mcp
+    container_name: mcp-server
+    environment:
+      - TAVILY_API_KEY=${TAVILY_API_KEY:-your-tavily-api-key}
+      - POSTGRES_DSN=postgresql://mcp_user:mcp_password@postgres:5432/mcp_retriever
+      - QDRANT_HOST=qdrant
+      - QDRANT_PORT=6333
+      - REDIS_URL=redis://redis:6379/0
+      - LOG_LEVEL=INFO
+    ports:
+      - "8001:8001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - mcp-network
+    restart: unless-stopped
+    # HTTP 모드로 실행
+    command: ["uv", "run", "fastmcp", "run", "src.server:mcp", "--http", "--port", "8001"]
+
+volumes:
+  postgres_data:
+  qdrant_data:
+  redis_data:
+
+networks:
+  mcp-network:
+    driver: bridge

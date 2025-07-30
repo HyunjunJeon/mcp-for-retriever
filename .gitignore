@@ -1,0 +1,29 @@
+# MacOS
+.DS_Store
+
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Lock files
+*.lock
+
+# Cache files
+.pytest_cache/
+.ruff_cache/
+
+# Environment variables
+.env
+
+# AI Copilot files
+.claude/
+CLAUDE.md
+.cursors/
+*mcp.json*
