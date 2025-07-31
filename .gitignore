@@ -11,6 +11,7 @@ wheels/
 
 # Virtual environments
 .venv
+.python-version
 
 # Lock files
 *.lock
@@ -21,9 +22,11 @@ wheels/
 
 # Environment variables
 .env
+.env-backup/
 
 # AI Copilot files
 .claude/
 CLAUDE.md
+.serena/
 .cursors/
 *mcp.json*

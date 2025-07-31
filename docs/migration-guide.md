@@ -41,12 +41,13 @@ MCP_PROFILE=COMPLETE python -m src.server_unified
 ### 2. 환경 변수 파일 사용
 
 ```bash
-# 프로파일별 환경 변수 파일 사용
-cp .env.auth .env
-python -m src.server_unified
+# 통합된 .env 파일 사용 (.env.example에서 복사)
+cp .env.example .env
+# .env 파일에서 MCP_PROFILE=AUTH로 설정하거나 환경 변수로 지정
+MCP_PROFILE=AUTH python -m src.server_unified
 
-# 또는 직접 지정
-python -m src.server_unified --env .env.complete
+# 또는 환경 변수로 직접 지정
+MCP_PROFILE=COMPLETE python -m src.server_unified
 ```
 
 ### 3. 커스텀 설정
@@ -74,8 +75,9 @@ python -m src.server_auth
 # 방법 1: 프로파일 사용
 MCP_PROFILE=AUTH python -m src.server_unified
 
-# 방법 2: 환경 변수 파일
-cp .env.auth .env
+# 방법 2: 통합된 환경 변수 파일
+cp .env.example .env
+# .env 파일에서 MCP_PROFILE=AUTH로 설정
 python -m src.server_unified
 
 # 방법 3: 개별 설정
@@ -137,8 +139,9 @@ python -m src.server_complete
 # 방법 1: 프로파일 사용 (권장)
 MCP_PROFILE=COMPLETE python -m src.server_unified
 
-# 방법 2: 환경 변수 파일
-cp .env.complete .env
+# 방법 2: 통합된 환경 변수 파일
+cp .env.example .env
+# .env 파일에서 MCP_PROFILE=COMPLETE로 설정 (기본값)
 python -m src.server_unified
 ```
 

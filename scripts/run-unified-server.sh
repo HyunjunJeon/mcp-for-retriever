@@ -42,7 +42,7 @@ usage() {
     echo "예시:"
     echo "  $0 --profile COMPLETE --transport http"
     echo "  $0 -p AUTH -t stdio"
-    echo "  $0 -p CUSTOM -e .env.custom"
+    echo "  $0 -p CUSTOM  # .env 파일에서 MCP_ENABLE_* 변수로 개별 기능 제어"
     exit 0
 }
 

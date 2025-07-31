@@ -500,9 +500,10 @@ python -m src.server_auth
 # 새로운 방식
 MCP_PROFILE=AUTH python -m src.server
 
-# 또는 환경 변수 파일 사용
-cp .env.auth .env
-python -m src.server
+# 또는 통합된 환경 변수 파일 사용
+cp .env.example .env
+# .env 파일에서 MCP_PROFILE=AUTH로 설정
+python -m src.server_unified
 ```
 
 ### Docker 사용자
