@@ -105,12 +105,16 @@ class QdrantRetriever(Retriever):
         """
         try:
             # Qdrant 클라이언트 생성
-            self._client = QdrantClient(
-                host=self.host,
-                port=self.port,
-                api_key=self.api_key,
-                timeout=self.timeout
-            )
+            # 메모리 모드 지원 (host가 ":memory:"인 경우)
+            if self.host == ":memory:":
+                self._client = QdrantClient(":memory:")
+            else:
+                self._client = QdrantClient(
+                    host=self.host,
+                    port=self.port,
+                    api_key=self.api_key,
+                    timeout=self.timeout
+                )
             
             # 연결 테스트 (컨렉션 목록 조회)
             await self._test_connection()
@@ -136,7 +140,8 @@ class QdrantRetriever(Retriever):
         모든 핑들링된 연결이 안전하게 종료됩니다.
         """
         if self._client:
-            await self._client.close()
+            # Qdrant client close is synchronous
+            self._client.close()
             self._client = None
         
         self._embed_text = None
@@ -190,8 +195,8 @@ class QdrantRetriever(Retriever):
             # 쿼리 텍스트를 임베딩으로 변환
             query_vector = await self._embed_text(query)
             
-            # 벡터 검색 수행
-            results = await self._client.search(
+            # 벡터 검색 수행 (Qdrant client search is synchronous)
+            results = self._client.search(
                 collection_name=collection,
                 query_vector=query_vector,
                 limit=limit,
@@ -231,8 +236,8 @@ class QdrantRetriever(Retriever):
             )
         
         try:
-            # 컨렉션 정보 조회
-            collections_info = await self._client.get_collections()
+            # 컨렉션 정보 조회 (Qdrant client method is synchronous)
+            collections_info = self._client.get_collections()
             collections_count = len(collections_info.collections)
             
             return RetrieverHealth(
@@ -285,7 +290,8 @@ class QdrantRetriever(Retriever):
         try:
             vector_size = vector_size or self.embedding_dim
             
-            await self._client.create_collection(
+            # Qdrant client create_collection is synchronous
+            self._client.create_collection(
                 collection_name=collection_name,
                 vectors_config=VectorParams(
                     size=vector_size,
@@ -348,8 +354,8 @@ class QdrantRetriever(Retriever):
                 )
                 points.append(point)
             
-            # 배치 업서트 (효율성을 위해 한 번에 처리)
-            await self._client.upsert(
+            # 배치 업서트 (효율성을 위해 한 번에 처리, Qdrant client method is synchronous)
+            self._client.upsert(
                 collection_name=collection,
                 points=points
             )
@@ -388,7 +394,8 @@ class QdrantRetriever(Retriever):
             raise ConnectionError("Not connected to Qdrant", "QdrantRetriever")
         
         try:
-            await self._client.delete(
+            # Qdrant client delete is synchronous
+            self._client.delete(
                 collection_name=collection,
                 points_selector=ids
             )
@@ -414,8 +421,8 @@ class QdrantRetriever(Retriever):
         if not self._client:
             raise Exception("Client not initialized")
         
-        # 컨렉션 목록 조회로 연결 확인
-        await self._client.get_collections()
+        # 컨렉션 목록 조회로 연결 확인 (Qdrant client method is synchronous)
+        self._client.get_collections()
     
     def _create_embedding_function(self) -> Callable:
         """

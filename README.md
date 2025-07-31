@@ -127,13 +127,25 @@ cp .env.example .env
 
 ```bash
 # 모든 서비스 시작
-./scripts/start-docker.sh --build
+docker-compose up -d
 
 # 이미지 재빌드가 필요한 경우
-./scripts/start-docker.sh --build
+docker-compose build --no-cache
+docker-compose up -d
 
-# 포그라운드에서 실행 (로그 실시간 확인)
-./scripts/start-docker.sh --no-detach
+# 로그 실시간 확인
+docker-compose logs -f
+```
+
+#### 3. 서비스 상태 확인
+
+```bash
+# 모든 컨테이너 상태 확인
+docker ps
+
+# 헬스 체크 상태
+curl http://localhost:8000/health  # Auth Gateway
+curl http://localhost:8001/health  # MCP Server (내부에서만 접근 가능)
 ```
 
 #### 3. 서비스 테스트
@@ -234,6 +246,140 @@ MCP_PROFILE=COMPLETE MCP_TRANSPORT=http uv run python -m src.server_unified
 | Auth Gateway | 8000 | 인증/인가 API |
 | MCP Server | 8001 | MCP 도구 서버 |
 
+## MCP 클라이언트 설정 (mcp.json)
+
+### Claude Desktop에서 사용하기
+
+Claude Desktop에서 MCP 서버에 연결하려면 `mcp.json` 파일을 다음과 같이 설정하세요:
+
+```json
+{
+  "mcpServers": {
+    "mcp-retriever": {
+      "url": "http://localhost:8000/mcp/proxy",
+      "transport": "sse",
+      "auth": {
+        "type": "bearer",
+        "token": "YOUR_JWT_TOKEN_HERE"
+      },
+      "description": "MCP Server for Web Search, Vector DB, and Database Queries"
+    }
+  }
+}
+```
+
+### Auth Gateway 접속 방법
+
+#### 1. 사용자 등록
+```bash
+curl -X POST http://localhost:8000/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{"email": "your@email.com", "password": "YourPassword123!"}'
+```
+
+**응답 예시**:
+```json
+{
+  "id": "550e8400-e29b-41d4-a716-446655440000",
+  "email": "your@email.com",
+  "created_at": "2025-07-31T10:00:00Z"
+}
+```
+
+#### 2. 로그인 및 토큰 획듍
+```bash
+curl -X POST http://localhost:8000/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email": "your@email.com", "password": "YourPassword123!"}'
+```
+
+**응답 예시**:
+```json
+{
+  "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+  "refresh_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+  "token_type": "bearer"
+}
+```
+
+#### 3. 토큰으로 인증된 요청 보내기
+```bash
+# 사용자 정보 조회
+curl -X GET http://localhost:8000/auth/me \
+  -H "Authorization: Bearer YOUR_ACCESS_TOKEN"
+
+# MCP 요청 프록시
+curl -X POST http://localhost:8000/mcp/proxy \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer YOUR_ACCESS_TOKEN" \
+  -d '{
+    "jsonrpc": "2.0",
+    "method": "tools/list",
+    "id": 1
+  }'
+```
+
+#### 4. 토큰 갱신
+액세스 토큰이 만료되면 (30분) 리프레시 토큰으로 갱신:
+```bash
+curl -X POST http://localhost:8000/auth/refresh \
+  -H "Content-Type: application/json" \
+  -d '{"refresh_token": "YOUR_REFRESH_TOKEN"}'
+```
+
+#### 5. mcp.json 업데이트
+획듍한 액세스 토큰을 `mcp.json`의 `token` 필드에 입력:
+```json
+{
+  "mcpServers": {
+    "mcp-retriever": {
+      "url": "http://localhost:8000/mcp/proxy",
+      "transport": "sse",
+      "auth": {
+        "type": "bearer",
+        "token": "YOUR_ACCESS_TOKEN_HERE"  // 여기에 토큰 입력
+      }
+    }
+  }
+}
+```
+
+### Auth Gateway API 엔드포인트
+
+| 엔드포인트 | 메소드 | 설명 | 인증 필요 |
+|-----------|--------|------|----------|
+| `/auth/register` | POST | 새 사용자 등록 | ❌ |
+| `/auth/login` | POST | 로그인 및 토큰 발급 | ❌ |
+| `/auth/refresh` | POST | 토큰 갱신 | ❌ |
+| `/auth/me` | GET | 현재 사용자 정보 | ✅ |
+| `/mcp/proxy` | POST | MCP 요청 프록시 | ✅ |
+| `/api/v1/users/search` | GET | 사용자 검색 | ✅ |
+| `/api/v1/users/{user_id}` | GET | 특정 사용자 조회 | ✅ |
+| `/health` | GET | 서비스 상태 확인 | ❌ |
+| `/docs` | GET | Swagger API 문서 | ❌ |
+
+### 대체 설정 (개발용)
+
+개발 환경에서 빠른 테스트를 위해 MCP 서버에 직접 연결:
+
+```json
+{
+  "mcpServers": {
+    "mcp-retriever-direct": {
+      "url": "http://localhost:8001/mcp/",
+      "transport": "sse",
+      "auth": {
+        "type": "bearer",
+        "token": "YOUR_MCP_INTERNAL_API_KEY"
+      },
+      "description": "Direct MCP Server Connection (Dev Only)"
+    }
+  }
+}
+```
+
+⚠️ **주의**: 직접 연결은 개발 환경에서만 사용하세요. 프로덕션에서는 항상 Auth Gateway를 통해 접속하세요.
+
 ## 사용 가능한 도구
 
 1. **search_web**: Tavily를 사용한 웹 검색
@@ -295,40 +441,155 @@ uv run ruff format src/
 
 ## 아키텍처
 
-시스템은 다음으로 구성됩니다:
+### 시스템 개요
 
-1. **리트리버 인터페이스**: 리트리버 계약을 정의하는 추상 기본 클래스
-2. **리트리버 구현체**: 
-   - TavilyRetriever: Tavily API를 통한 웹 검색
-   - QdrantRetriever: 벡터 유사성 검색
-   - PostgresRetriever: SQL 및 텍스트 검색
-3. **리트리버 팩토리**: 리트리버 인스턴스화를 위한 의존성 주입
-4. **FastMCP 서버**: 도구 엔드포인트와 Context 지원을 갖춘 MCP 프로토콜 서버
-5. **인증 게이트웨이**: RBAC를 통한 JWT 기반 액세스 제어
-6. **캐싱 레이어**: 구성 가능한 TTL을 가진 Redis 기반 캐싱
-7. **Docker 인프라**: 헬스 체크를 포함한 완전한 컨테이너화
+MCP Server for Retriever는 다양한 데이터 소스(Web Search, Vector DB, RDB)를 통합하여 MCP(Model Context Protocol)를 통해 제공하는 마이크로서비스 아키텍처 시스템입니다.
 
-### 서비스 아키텍처
+### 아키텍처 다이어그램
 
+```mermaid
+graph TB
+    subgraph "Client Layer"
+        Client[MCP Client<br/>Claude/LLM]
+    end
+
+    subgraph "Gateway Layer"
+        AuthGateway[Auth Gateway<br/>:8000<br/>JWT Auth & RBAC]
+    end
+
+    subgraph "Service Layer"
+        MCPServer[MCP Server<br/>:8001<br/>FastMCP v2.10.6]
+    end
+
+    subgraph "Data Layer"
+        subgraph "Cache"
+            Redis[(Redis<br/>:6379<br/>Session & Cache)]
+        end
+        
+        subgraph "Databases"
+            PostgreSQL[(PostgreSQL<br/>:5432<br/>Users & Content)]
+            Qdrant[(Qdrant<br/>:6333/6334<br/>Vector Store)]
+        end
+    end
+
+    subgraph "External Services"
+        Tavily[Tavily API<br/>Web Search]
+    end
+
+    %% Client connections
+    Client -->|HTTP/SSE| AuthGateway
+    
+    %% Auth Gateway connections
+    AuthGateway -->|Proxy MCP| MCPServer
+    AuthGateway <-->|Auth Data| PostgreSQL
+    AuthGateway <-->|Session| Redis
+    
+    %% MCP Server connections
+    MCPServer <-->|Query| PostgreSQL
+    MCPServer <-->|Vector Search| Qdrant
+    MCPServer <-->|Cache| Redis
+    MCPServer -->|Web Search| Tavily
+    
+    %% Network
+    AuthGateway -.->|Docker Network<br/>172.20.0.0/16| MCPServer
+    MCPServer -.->|Internal| Redis
+    MCPServer -.->|Internal| PostgreSQL
+    MCPServer -.->|Internal| Qdrant
 ```
-┌─────────────────┐     ┌─────────────────┐
-│   Auth Gateway  │     │   MCP Server    │
-│   (Port 8000)   │────▶│   (Port 8001)   │
-└─────────────────┘     └─────────────────┘
-         │                       │
-         ▼                       ▼
-┌─────────────────┐     ┌─────────────────┐
-│      Redis      │     │   PostgreSQL    │
-│   (Port 6379)   │     │   (Port 5432)   │
-└─────────────────┘     └─────────────────┘
-                               │
-                        ┌─────────────────┐
-                        │     Qdrant      │
-                        │   (Port 6333)   │
-                        └─────────────────┘
-```
+
+### 컴포넌트 상세
+
+#### 1. Auth Gateway (Port 8000)
+- **Technology**: FastAPI + Uvicorn
+- **Features**:
+  - JWT 기반 인증 (HS256)
+  - 역할 기반 접근 제어 (RBAC)
+  - MCP 요청 프록시
+  - 사용자 관리 API
+  - 상태 체크: `/health`
+
+#### 2. MCP Server (Port 8001)
+- **Technology**: FastMCP v2.10.6
+- **Transport**: Streamable HTTP
+- **Features**:
+  - 통합 검색 도구 제공
+  - 컨텍스트 추적
+  - 캐싱 지원
+  - 구조화된 로깅
+
+#### 3. PostgreSQL (Port 5432)
+- **Version**: 17-alpine
+- **Database**: mcp_retriever
+- **Functions**:
+  - 사용자 인증 정보
+  - 콘텐츠 저장소
+  - 전문 검색 지원
+
+#### 4. Qdrant (Port 6333/6334)
+- **Version**: latest
+- **Functions**:
+  - 벡터 임베딩 저장
+  - 시맨틱 검색
+  - gRPC 인터페이스 (6334)
+
+#### 5. Redis (Port 6379)
+- **Version**: latest
+- **Functions**:
+  - 세션 관리
+  - 검색 결과 캐싱
+  - 분산 잠금
 
 자세한 설계 정보는 [아키텍처 문서](/reference_docs/architecture.md)를 참조하세요.
+
+## Docker Compose 구성
+
+```yaml
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: mcp-postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mcp_user -d mcp_retriever"]
+    
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: mcp-qdrant
+    ports:
+      - "6333:6333"  # HTTP
+      - "6334:6334"  # gRPC
+    
+  redis:
+    image: redis:latest
+    container_name: mcp-redis
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+    
+  auth-gateway:
+    build: ./docker/Dockerfile.auth
+    container_name: mcp-auth-gateway
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    
+  mcp-server:
+    build: ./docker/Dockerfile.mcp
+    container_name: mcp-server
+    environment:
+      MCP_PROFILE: DEV
+      MCP_TRANSPORT: http
+    depends_on:
+      auth-gateway:
+        condition: service_healthy
+
+networks:
+  mcp-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+```
 
 ## 프로젝트 상태
 
@@ -393,25 +654,7 @@ uv run ruff format src/
 
 ## API 예제
 
-### 인증
-
-```bash
-# 새 사용자 등록
-curl -X POST http://localhost:8000/auth/register \
-  -H "Content-Type: application/json" \
-  -d '{"email": "user@example.com", "password": "Password123!"}'
-
-# 로그인
-curl -X POST http://localhost:8000/auth/login \
-  -H "Content-Type: application/json" \
-  -d '{"email": "user@example.com", "password": "Password123!"}'
-
-# 사용자 정보 가져오기
-curl -X GET http://localhost:8000/auth/me \
-  -H "Authorization: Bearer <access_token>"
-```
-
-### MCP 도구 (Auth Gateway 경유)
+### MCP 도구 사용 (Auth Gateway 경유)
 
 ```bash
 # 먼저 액세스 토큰 획득
@@ -579,31 +822,49 @@ CACHE_TTL_SECONDS=300
 
 ```bash
 # 컨테이너 상태 확인
-docker-compose -f docker-compose.local.yml ps
+docker-compose ps
 
 # 특정 컨테이너 접속
 docker exec -it mcp-postgres psql -U mcp_user -d mcp_retriever
 docker exec -it mcp-redis redis-cli
 docker exec -it mcp-auth-gateway /bin/sh
+docker exec -it mcp-server /bin/sh
 
 # 이미지 재빌드
-docker-compose -f docker-compose.local.yml build
+docker-compose build
 
 # 전체 시스템 재시작
-docker-compose -f docker-compose.local.yml restart
+docker-compose restart
+
+# 로그 확인
+docker logs mcp-server --tail 50
+docker logs mcp-auth-gateway --tail 50
 ```
 
 ## 🔍 문제 해결
 
 ### 포트 충돌
 
-이미 사용 중인 포트가 있다면 `docker-compose.local.yml`에서 포트 매핑을 변경하세요:
+이미 사용 중인 포트가 있다면 `docker-compose.yml`에서 포트 매핑을 변경하세요:
 
 ```yaml
 services:
   postgres:
     ports:
       - "15432:5432"  # 호스트 포트를 15432로 변경
+```
+
+### Docker 빌드 캐시 문제
+
+빌드 캐시로 인해 변경사항이 반영되지 않을 때:
+
+```bash
+# 빌드 캐시 완전 제거
+docker builder prune -af
+
+# 캐시 없이 재빌드
+docker-compose build --no-cache
+docker-compose up -d
 ```
 
 ### 권한 문제
@@ -626,8 +887,78 @@ docker-compose -f docker-compose.local.yml ps
 ./scripts/logs-docker.sh [서비스명]
 ```
 
+## 🚀 배포 현황
+
+### ✅ 성공적으로 배포된 서비스
+1. **PostgreSQL**: Healthy, 스키마 초기화 완료
+2. **Qdrant**: Running, 벡터 작업 준비 완료
+3. **Redis**: Healthy, 연결 수락 중
+4. **Auth Gateway**: Healthy, JWT 인증 운영 중
+5. **MCP Server**: Healthy, 모든 도구 사용 가능
+
+### 🔧 사용된 구성
+- **Profile**: DEV (개발 모드)
+- **Transport**: HTTP (Streamable)
+- **Rate Limiting**: 개발용으로 비활성화
+- **Caching**: Redis로 활성화
+- **Authentication**: 내부 API 키와 함께 JWT
+
+### 📊 리소스 할당
+- **Network**: Bridge 네트워크 (172.20.0.0/16)
+- **Volumes**: 모든 데이터베이스의 영구 저장소
+- **Health Checks**: 모든 서비스에 구성됨
+- **Restart Policy**: unless-stopped
+
+## API 플로우
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant AG as Auth Gateway
+    participant MS as MCP Server
+    participant R as Redis
+    participant PG as PostgreSQL
+    participant Q as Qdrant
+    participant T as Tavily
+
+    %% Authentication Flow
+    C->>AG: POST /auth/login
+    AG->>PG: Verify credentials
+    PG-->>AG: User data
+    AG->>R: Store session
+    AG-->>C: JWT token
+
+    %% MCP Tool Call Flow
+    C->>AG: POST /mcp/<br/>Authorization: Bearer {token}
+    AG->>AG: Validate JWT
+    AG->>MS: Proxy MCP request
+    
+    alt search_web
+        MS->>T: Search query
+        T-->>MS: Web results
+    else search_vectors
+        MS->>Q: Vector query
+        Q-->>MS: Similar documents
+    else search_database
+        MS->>PG: SQL query
+        PG-->>MS: Query results
+    else search_all
+        MS->>T: Concurrent
+        MS->>Q: searches
+        MS->>PG: 
+        T-->>MS: Combined
+        Q-->>MS: results
+        PG-->>MS: 
+    end
+    
+    MS->>R: Cache results
+    MS-->>AG: Tool response
+    AG-->>C: MCP response
+```
+
 ## 문서
 
+- [완성된 아키텍처](completed_architecture.md) - 현재 배포된 시스템의 전체 아키텍처
 - [아키텍처](/reference_docs/architecture.md) - 시스템 설계 및 구성 요소
 - [보안 및 성능](/reference_docs/security_performance_monitoring.md) - 프로덕션 고려 사항
 - [API 레퍼런스](http://localhost:8000/docs) - 대화형 API 문서 (실행 중일 때)

@@ -1,0 +1,1 @@
+"""MCP protocol and SSE-related integration tests"""

@@ -186,9 +186,9 @@ class PostgresRetriever(Retriever):
             async with self._pool.acquire() as conn:
                 if self._is_sql_query(query) and limit not in params:
                     # SQL 쿼리에 LIMIT 플레이스홀더가 있는 경우
-                    results = await conn.fetchall(sql_query, limit)
+                    results = await conn.fetch(sql_query, limit)
                 else:
-                    results = await conn.fetchall(sql_query, *params)
+                    results = await conn.fetch(sql_query, *params)
                 
                 # 결과를 하나씩 yield
                 for row in results:

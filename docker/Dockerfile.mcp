@@ -27,5 +27,8 @@ COPY CLAUDE.md ./
 ENV PYTHONPATH=/app
 ENV PYTHONUNBUFFERED=1
 
-# MCP 서버 실행 (stdio 모드)
-CMD ["uv", "run", "python", "-m", "src.server"]
+# MCP 서버 포트 노출
+EXPOSE 8001
+
+# MCP 서버 실행 (HTTP 모드로 변경)
+CMD ["uv", "run", "python", "-m", "src.server_unified"]

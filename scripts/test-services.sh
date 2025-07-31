@@ -103,6 +103,7 @@ echo "------------------"
 echo -n "🔍 MCP 도구 목록 조회 중... "
 tools_response=$(curl -s -X POST "http://localhost:8001/" \
     -H "Content-Type: application/json" \
+    -H "Authorization: Bearer your-internal-api-key-change-in-production" \
     -d '{
         "jsonrpc": "2.0",
         "method": "tools/list",
@@ -121,6 +122,7 @@ echo ""
 echo "📊 테스트 완료!"
 echo ""
 echo "💡 추가 테스트를 위한 명령어:"
-echo "   - 컨테이너 상태: docker-compose -f docker-compose.local.yml ps"
+echo "   - 컨테이너 상태: docker-compose ps"
 echo "   - 로그 확인: ./scripts/logs-docker.sh [서비스명]"
 echo "   - API 문서: http://localhost:8000/docs (Auth Gateway)"
+echo "   - 통합 테스트: uv run python tests/integration_custom/test_complete_system.py"

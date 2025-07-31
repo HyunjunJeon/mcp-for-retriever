@@ -41,15 +41,34 @@ class RBACService:
             "search_vectors": (ResourceType.VECTOR_DB, ActionType.WRITE),  # 벡터 검색은 WRITE 권한 필요
             "search_database": (ResourceType.DATABASE, ActionType.WRITE),  # DB 검색은 WRITE 권한 필요
             "search_all": None,  # 모든 리소스에 대한 READ 권한 필요
+            # 벡터 DB CRUD 도구들
+            "create_vector_collection": (ResourceType.VECTOR_DB, ActionType.WRITE),
+            "create_vector_document": (ResourceType.VECTOR_DB, ActionType.WRITE),
+            "update_vector_document": (ResourceType.VECTOR_DB, ActionType.WRITE),
+            "delete_vector_document": (ResourceType.VECTOR_DB, ActionType.WRITE),
+            # PostgreSQL CRUD 도구들
+            "create_database_record": (ResourceType.DATABASE, ActionType.WRITE),
+            "update_database_record": (ResourceType.DATABASE, ActionType.WRITE),
+            "delete_database_record": (ResourceType.DATABASE, ActionType.WRITE),
         }
         
         # 도구별 최소 필요 역할 (추가 제약)
-        # guest는 search_web 도구를 사용할 수 없도록 제한
+        # guest는 health_check만 접근 가능
         self.tool_minimum_roles = {
-            "search_web": ["user", "admin"],  # guest 제외
-            "search_vectors": ["user", "admin"],  # user도 사용 가능
-            "search_database": ["admin"],
+            "search_web": ["user", "admin"],  # guest/viewer 제외, analyst는 user로 매핑됨
+            "search_vectors": ["user", "admin"],  # user(analyst 포함)도 사용 가능
+            "search_database": ["user", "admin"],  # user도 접근 가능하도록 수정
             "search_all": ["admin"],
+            "health_check": [],  # 모든 사용자 접근 가능
+            # 벡터 DB CRUD 도구들 - 더 높은 권한 필요
+            "create_vector_collection": ["user", "admin"],  # user(analyst 포함)와 admin만
+            "create_vector_document": ["user", "admin"],
+            "update_vector_document": ["user", "admin"],
+            "delete_vector_document": ["admin"],  # 삭제는 admin만 가능
+            # PostgreSQL CRUD 도구들 - 데이터베이스 직접 조작
+            "create_database_record": ["user", "admin"],  # user(analyst 포함)와 admin
+            "update_database_record": ["user", "admin"],  # user(analyst 포함)와 admin
+            "delete_database_record": ["admin"],  # 삭제는 admin만 가능
         }
     
     def _get_default_permissions(self) -> dict[str, list[Permission]]:
@@ -67,11 +86,37 @@ class RBACService:
                 Permission(resource=ResourceType.WEB_SEARCH, action=ActionType.READ),
                 Permission(resource=ResourceType.VECTOR_DB, action=ActionType.READ),
                 Permission(resource=ResourceType.VECTOR_DB, action=ActionType.WRITE),  # search_vectors 사용을 위해 추가
+                Permission(resource=ResourceType.DATABASE, action=ActionType.READ),
+                Permission(resource=ResourceType.DATABASE, action=ActionType.WRITE),  # analyst도 DB CRUD 가능
             ],
             "guest": [
                 Permission(resource=ResourceType.WEB_SEARCH, action=ActionType.READ),
             ],
+            # 새로운 역할 (별칭을 통해 기존 역할과 매핑됨)
+            "viewer": [
+                Permission(resource=ResourceType.WEB_SEARCH, action=ActionType.READ),
+            ],
+            "analyst": [
+                Permission(resource=ResourceType.WEB_SEARCH, action=ActionType.READ),
+                Permission(resource=ResourceType.VECTOR_DB, action=ActionType.READ),
+                Permission(resource=ResourceType.VECTOR_DB, action=ActionType.WRITE),  # search_vectors 사용을 위해 추가
+            ],
         }
+    
+    def _get_canonical_role(self, role: str) -> str:
+        """역할 별칭을 정규화된 역할로 변환
+        
+        Args:
+            role: 역할 이름 (별칭 포함)
+            
+        Returns:
+            정규화된 역할 이름
+        """
+        role_aliases = {
+            "viewer": "guest",
+            "analyst": "user"
+        }
+        return role_aliases.get(role, role)
     
     def check_permission(
         self,
@@ -94,9 +139,10 @@ class RBACService:
             logger.debug("빈 역할 목록으로 권한 확인", resource=resource, action=action)
             return False
         
-        # 각 역할의 권한 확인
+        # 각 역할의 권한 확인 (정규화된 역할 사용)
         for role in roles:
-            permissions = self.role_permissions.get(role, [])
+            canonical_role = self._get_canonical_role(role)
+            permissions = self.role_permissions.get(canonical_role, [])
             
             for permission in permissions:
                 # 정확한 권한 일치
@@ -165,7 +211,8 @@ class RBACService:
         permissions_set: set[Permission] = set()
         
         for role in roles:
-            role_permissions = self.role_permissions.get(role, [])
+            canonical_role = self._get_canonical_role(role)
+            role_permissions = self.role_permissions.get(canonical_role, [])
             permissions_set.update(role_permissions)
         
         return list(permissions_set)
@@ -185,17 +232,21 @@ class RBACService:
             logger.warning("알 수 없는 도구", tool_name=tool_name)
             return False
         
-        # 최소 역할 요구사항 확인
+        # 최소 역할 요구사항 확인 (정규화된 역할 사용)
         if tool_name in self.tool_minimum_roles:
             minimum_roles = self.tool_minimum_roles[tool_name]
-            if not any(role in minimum_roles for role in roles):
-                logger.debug(
-                    "도구 사용에 필요한 최소 역할 부족",
-                    tool_name=tool_name,
-                    user_roles=roles,
-                    required_roles=minimum_roles,
-                )
-                return False
+            # 빈 리스트는 모든 사용자 접근 가능을 의미
+            if minimum_roles:
+                canonical_roles = [self._get_canonical_role(role) for role in roles]
+                if not any(role in minimum_roles for role in canonical_roles):
+                    logger.debug(
+                        "도구 사용에 필요한 최소 역할 부족",
+                        tool_name=tool_name,
+                        user_roles=roles,
+                        canonical_roles=canonical_roles,
+                        required_roles=minimum_roles,
+                    )
+                    return False
         
         required_permission = self.tool_permissions[tool_name]
         
@@ -302,8 +353,9 @@ class RBACService:
             )
             return True
         
-        # 2. admin은 모든 권한 가짐
-        if "admin" in roles:
+        # 2. admin은 모든 권한 가짐 (정규화된 역할 체크)
+        canonical_roles = [self._get_canonical_role(role) for role in roles]
+        if "admin" in canonical_roles:
             return True
         
         # 3. 세밀한 권한이 없으면 거부
@@ -382,8 +434,9 @@ class RBACService:
             allowed_patterns.append("*")  # 모든 리소스 접근 가능
             return allowed_patterns
         
-        # 2. admin은 모든 권한
-        if "admin" in roles:
+        # 2. admin은 모든 권한 (정규화된 역할 체크)
+        canonical_roles = [self._get_canonical_role(role) for role in roles]
+        if "admin" in canonical_roles:
             allowed_patterns.append("*")
             return allowed_patterns
         

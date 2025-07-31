@@ -26,11 +26,16 @@ if [ ! -f .env ]; then
     fi
 fi
 
-# Docker Compose 파일 선택
-COMPOSE_FILE="docker-compose.local.yml"
+# Docker Compose 파일 선택 (루트 레벨 우선)
+COMPOSE_FILE="docker-compose.yml"
 if [ ! -f "$COMPOSE_FILE" ]; then
-    echo "⚠️  docker-compose.local.yml 파일이 없습니다. 기본 파일을 사용합니다."
-    COMPOSE_FILE="docker-compose.yml"
+    echo "⚠️  루트 레벨 docker-compose.yml 파일이 없습니다. docker/ 디렉토리를 확인합니다."
+    COMPOSE_FILE="docker/docker-compose.yml"
+fi
+
+if [ ! -f "$COMPOSE_FILE" ]; then
+    echo "❌ Docker Compose 파일을 찾을 수 없습니다."
+    exit 1
 fi
 
 echo "📋 사용할 Docker Compose 파일: $COMPOSE_FILE"

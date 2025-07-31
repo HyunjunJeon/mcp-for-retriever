@@ -998,7 +998,131 @@ async def get_user_by_id(
     return user
 
 
+# === 초기화 엔드포인트 (개발/테스트용) ===
+
+@app.post("/api/v1/init/admin", response_model=UserResponse)
+async def init_admin(
+    auth_service: Annotated[AuthService, Depends(get_auth_service)],
+):
+    """
+    초기 관리자 계정 생성 (개발/테스트 전용)
+    
+    주의: 이 엔드포인트는 프로덕션에서 비활성화해야 합니다!
+    관리자가 없을 때만 작동하며, 이미 관리자가 있으면 실패합니다.
+    
+    Returns:
+        UserResponse: 생성된 관리자 계정 정보
+        
+    Raises:
+        HTTPException 400: 이미 관리자가 존재함
+    """
+    # 기존 관리자 확인
+    all_users = await auth_service.list_all_users(skip=0, limit=1000)
+    for user in all_users:
+        if "admin" in user.roles:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="이미 관리자가 존재합니다"
+            )
+    
+    # 관리자 계정 생성
+    try:
+        # 1. 사용자 생성
+        user_create = UserCreate(
+            email="superadmin@mcp.com",
+            password="SuperAdmin123!"
+        )
+        user = await auth_service.register(user_create)
+        
+        # 2. admin 역할 부여
+        updated_user = await auth_service.user_repository.update(
+            user.id,
+            {"roles": ["admin"]}
+        )
+        
+        if not updated_user:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="관리자 역할 설정 실패"
+            )
+        
+        logger.info("초기 관리자 생성 완료", user_id=user.id)
+        return UserResponse(**updated_user.model_dump())
+        
+    except AuthenticationError as e:
+        # 이미 존재하는 경우 역할만 업데이트
+        existing_user = await auth_service.user_repository.get_by_email("superadmin@mcp.com")
+        if existing_user:
+            updated_user = await auth_service.user_repository.update(
+                existing_user.id,
+                {"roles": ["admin"]}
+            )
+            if updated_user:
+                logger.info("기존 사용자를 관리자로 승격", user_id=existing_user.id)
+                return UserResponse(**updated_user.model_dump())
+        
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+
+
 # === 관리자 엔드포인트 ===
+
+@app.put("/api/v1/admin/users/{user_id}/roles", response_model=UserResponse)
+async def update_user_roles(
+    user_id: str,
+    roles: list[str],
+    current_user: Annotated[UserResponse, Depends(require_admin)],
+    auth_service: Annotated[AuthService, Depends(get_auth_service)],
+):
+    """사용자 역할 업데이트 (관리자 전용)
+    
+    지정된 사용자의 역할을 업데이트합니다.
+    
+    Args:
+        user_id: 업데이트할 사용자 ID
+        roles: 새로운 역할 목록
+        current_user: 현재 관리자 사용자
+        auth_service: 인증 서비스 인스턴스
+        
+    Returns:
+        UserResponse: 업데이트된 사용자 정보
+        
+    Raises:
+        HTTPException 404: 사용자를 찾을 수 없음
+        HTTPException 403: 관리자 권한 없음
+    """
+    # 사용자 조회
+    user = await auth_service.user_repository.get_by_id(user_id)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"사용자를 찾을 수 없습니다: {user_id}"
+        )
+    
+    # 역할 업데이트
+    updated_user = await auth_service.user_repository.update(
+        user_id,
+        {"roles": roles}
+    )
+    
+    if not updated_user:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="사용자 역할 업데이트 실패"
+        )
+    
+    logger.info(
+        "사용자 역할 업데이트",
+        admin_id=current_user.id,
+        user_id=user_id,
+        new_roles=roles,
+        old_roles=user.roles
+    )
+    
+    return UserResponse(**updated_user.model_dump())
+
 
 @app.get("/api/v1/admin/users", response_model=list[UserResponse])
 async def list_users(

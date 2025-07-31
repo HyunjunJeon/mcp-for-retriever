@@ -117,26 +117,81 @@ class MCPProxyService:
         
         args = params.get("arguments", {})
         
-        # search_vectors: collection 파라미터 체크
-        if tool_name == "search_vectors" and "collection" in args:
+        # 벡터 DB 도구들: collection 파라미터 체크
+        vector_tools = [
+            "search_vectors",
+            "create_vector_collection",
+            "create_vector_document",
+            "update_vector_document",
+            "delete_vector_document"
+        ]
+        if tool_name in vector_tools and "collection" in args:
             resources.append((ResourceType.VECTOR_DB, args["collection"]))
         
-        # search_database: tables 파라미터 체크
+        # PostgreSQL CRUD 도구들: table 파라미터 체크
+        postgres_crud_tools = [
+            "create_database_record",
+            "update_database_record",
+            "delete_database_record"
+        ]
+        if tool_name in postgres_crud_tools and "table" in args:
+            table = args["table"]
+            # 스키마가 없으면 public 스키마 가정
+            if '.' not in table:
+                table = f"public.{table}"
+            resources.append((ResourceType.DATABASE, table))
+        
+        # search_database: query에서 테이블 추출
         elif tool_name == "search_database":
-            # query에서 테이블 추출 (간단한 파싱)
-            query = args.get("query", "").lower()
-            # FROM 절에서 테이블 추출 (간단한 정규식)
-            import re
-            from_pattern = r'from\s+([^\s,]+)'
-            matches = re.findall(from_pattern, query)
-            for table in matches:
-                # 스키마.테이블 형식 처리
-                table = table.strip('`"\'')
+            # table 파라미터가 있으면 우선 사용
+            if "table" in args:
+                table = args["table"]
                 if '.' not in table:
                     table = f"public.{table}"
                 resources.append((ResourceType.DATABASE, table))
+            else:
+                # query에서 테이블 추출 (간단한 파싱)
+                query = args.get("query", "").lower()
+                if query:
+                    # FROM 절에서 테이블 추출 (간단한 정규식)
+                    import re
+                    from_pattern = r'from\s+([^\s,]+)'
+                    matches = re.findall(from_pattern, query)
+                    for table in matches:
+                        # 스키마.테이블 형식 처리
+                        table = table.strip('`"\'')
+                        if '.' not in table:
+                            table = f"public.{table}"
+                        resources.append((ResourceType.DATABASE, table))
         
         return resources
+    
+    def _get_required_action_for_tool(self, tool_name: str) -> ActionType:
+        """도구별 필요한 액션 타입 결정
+        
+        Args:
+            tool_name: 도구 이름
+            
+        Returns:
+            필요한 액션 타입
+        """
+        # 쓰기 권한이 필요한 도구들
+        write_tools = [
+            # 벡터 DB CRUD
+            "create_vector_collection",
+            "create_vector_document", 
+            "update_vector_document",
+            "delete_vector_document",
+            # PostgreSQL CRUD
+            "create_database_record",
+            "update_database_record",
+            "delete_database_record",
+            # 검색 도구 중 일부 (테스트 요구사항)
+            "search_vectors",
+            "search_database"
+        ]
+        
+        return ActionType.WRITE if tool_name in write_tools else ActionType.READ
     
     async def _filter_tools_by_roles(
         self,
@@ -412,8 +467,8 @@ class MCPProxyService:
                         )
                     
                     for resource_type, resource_name in resources:
-                        # 도구별 필요 권한 확인 (search_vectors/database는 WRITE 권한 필요)
-                        required_action = ActionType.WRITE if tool_name in ["search_vectors", "search_database"] else ActionType.READ
+                        # 도구별 필요 권한 확인
+                        required_action = self._get_required_action_for_tool(tool_name)
                         
                         if not self.rbac_service.check_resource_permission(
                             user_roles,
@@ -427,12 +482,21 @@ class MCPProxyService:
                                 user_roles=user_roles,
                                 resource_type=resource_type,
                                 resource_name=resource_name,
+                                required_action=required_action.value,
+                                tool_name=tool_name,
                             )
+                            action_str = "쓰기" if required_action == ActionType.WRITE else "읽기"
                             return MCPResponse(
                                 id=request.id,
                                 error={
                                     "code": -32603,
-                                    "message": f"{resource_name}에 대한 접근 권한이 없습니다",
+                                    "message": f"{resource_type.value} '{resource_name}'에 대한 {action_str} 권한이 없습니다",
+                                    "data": {
+                                        "resource_type": resource_type.value,
+                                        "resource_name": resource_name,
+                                        "required_action": required_action.value,
+                                        "tool": tool_name
+                                    }
                                 },
                             )
                 
@@ -452,9 +516,20 @@ class MCPProxyService:
             # MCP 서버로 요청 전달
             # FastMCP HTTP 모드는 /mcp/ 경로 사용
             mcp_url = self.mcp_server_url.rstrip("/") + "/mcp/"
+            
+            # 디버깅을 위한 요청 정보 로그
+            request_data = request.model_dump(exclude_none=True)
+            logger.debug(
+                "MCP 서버로 요청 전달",
+                url=mcp_url,
+                headers=request_headers,
+                request_data=request_data,
+                method=request.method
+            )
+            
             response = await self.http_client.post(
                 mcp_url,
-                json=request.model_dump(exclude_none=True),
+                json=request_data,
                 headers=request_headers,
             )
             response.raise_for_status()
@@ -687,7 +762,7 @@ class MCPProxyService:
                     )
                 
                 for resource_type, resource_name in resources:
-                    required_action = ActionType.WRITE if tool_name in ["search_vectors", "search_database"] else ActionType.READ
+                    required_action = self._get_required_action_for_tool(tool_name)
                     
                     if not self.rbac_service.check_resource_permission(
                         user_roles,
@@ -696,12 +771,19 @@ class MCPProxyService:
                         required_action,
                         resource_permissions
                     ):
+                        action_str = "쓰기" if required_action == ActionType.WRITE else "읽기"
                         error_data = {
                             "jsonrpc": "2.0",
                             "id": request.id,
                             "error": {
                                 "code": -32603,
-                                "message": f"{resource_name}에 대한 접근 권한이 없습니다",
+                                "message": f"{resource_type.value} '{resource_name}'에 대한 {action_str} 권한이 없습니다",
+                                "data": {
+                                    "resource_type": resource_type.value,
+                                    "resource_name": resource_name,
+                                    "required_action": required_action.value,
+                                    "tool": tool_name
+                                }
                             },
                         }
                         yield f"event: error\ndata: {json.dumps(error_data)}\n\n"

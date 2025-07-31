@@ -55,11 +55,11 @@ DEV_CONFIG = ServerConfig(
         enable_cache_stats=True,
     ),
     
-    # 개발용 속도 제한 (관대함)
+    # 개발용 속도 제한 (관대함) - 검증 통과를 위해 수정
     rate_limit_config=RateLimitConfig(
-        requests_per_minute=1000,
-        requests_per_hour=10000,
-        burst_size=100,
+        requests_per_minute=100,
+        requests_per_hour=6000,  # 100 * 60 = 6000
+        burst_size=50,
     ),
     
     # 개발용 로깅 (상세)
