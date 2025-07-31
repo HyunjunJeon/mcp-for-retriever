@@ -13,8 +13,7 @@ import os
 from typing import Any, Dict, List
 import httpx
 
-from fastmcp import FastMCPClient
-from fastmcp.client import MCPClient
+from fastmcp import Client
 
 # 테스트용 환경 변수 설정
 TEST_ENV = {
@@ -30,7 +29,7 @@ TEST_ENV = {
 class TestMCPClientE2E:
     """FastMCP Client를 사용한 E2E 테스트"""
     
-    @pytest.fixture(scope="class")
+    @pytest.fixture(scope="function")
     async def server_process(self):
         """테스트용 서버 프로세스 시작"""
         # 환경 변수 설정
@@ -58,32 +57,30 @@ class TestMCPClientE2E:
     async def mcp_client(self, server_process):
         """MCP 클라이언트 생성"""
         # FastMCP 클라이언트 생성
-        client = MCPClient(
-            base_url=f"http://localhost:{TEST_ENV['MCP_SERVER_PORT']}",
-            headers={
-                "Authorization": f"Bearer {TEST_ENV['MCP_INTERNAL_API_KEY']}"
-            }
+        # MCP 서버는 /mcp/ 경로를 사용
+        client = Client(
+            f"http://localhost:{TEST_ENV['MCP_SERVER_PORT']}/mcp/",
+            auth=f"Bearer {TEST_ENV['MCP_INTERNAL_API_KEY']}"
         )
+        
+        # 클라이언트 연결
+        await client.__aenter__()
         
         yield client
         
         # 클라이언트 정리
-        await client.close()
+        await client.__aexit__(None, None, None)
     
     @pytest.mark.asyncio
     async def test_list_tools(self, mcp_client):
         """도구 목록 조회 테스트"""
-        # 도구 목록 요청
-        response = await mcp_client.request(
-            method="tools/list",
-            params={}
-        )
+        # 도구 목록 조회
+        tools = await mcp_client.list_tools()
         
-        assert response is not None
-        assert "result" in response
+        assert tools is not None
+        assert len(tools) > 0
         
-        tools = response["result"].get("tools", [])
-        tool_names = [tool["name"] for tool in tools]
+        tool_names = [tool.name for tool in tools]
         
         # 기본 도구들이 있는지 확인
         assert "search_web" in tool_names
@@ -96,42 +93,33 @@ class TestMCPClientE2E:
     async def test_search_web_tool(self, mcp_client):
         """웹 검색 도구 테스트"""
         # search_web 도구 호출
-        response = await mcp_client.request(
-            method="tools/call",
-            params={
-                "name": "search_web",
-                "arguments": {
-                    "query": "FastMCP test",
-                    "limit": 5
-                }
+        result = await mcp_client.call_tool(
+            "search_web",
+            {
+                "query": "FastMCP test",
+                "limit": 5
             }
         )
         
-        assert response is not None
-        assert "result" in response
-        
-        result = response["result"]
-        
+        assert result is not None
+        # result.data는 도구의 반환값
         # Tavily API가 설정되지 않았으므로 오류가 발생할 수 있음
         # 하지만 도구 호출 자체는 성공해야 함
-        assert isinstance(result, (dict, list))
+        assert result.data is not None
     
     @pytest.mark.asyncio
     async def test_health_check_tool(self, mcp_client):
         """헬스 체크 도구 테스트"""
         # health_check 도구 호출
-        response = await mcp_client.request(
-            method="tools/call",
-            params={
-                "name": "health_check",
-                "arguments": {}
-            }
+        result = await mcp_client.call_tool(
+            "health_check",
+            {}
         )
         
-        assert response is not None
-        assert "result" in response
+        assert result is not None
+        assert result.data is not None
         
-        health = response["result"]
+        health = result.data
         assert "status" in health
         assert "service" in health
         assert health["service"] == "mcp-retriever"
@@ -195,18 +183,13 @@ class TestMCPClientE2E:
     async def test_error_handling(self, mcp_client):
         """오류 처리 테스트"""
         # 존재하지 않는 도구 호출
-        response = await mcp_client.request(
-            method="tools/call",
-            params={
-                "name": "non_existent_tool",
-                "arguments": {}
-            }
-        )
+        from fastmcp.exceptions import ToolError
         
-        # 오류 응답 확인
-        assert "error" in response
-        error = response["error"]
-        assert "message" in error
+        with pytest.raises(ToolError):
+            await mcp_client.call_tool(
+                "non_existent_tool",
+                {}
+            )
     
     @pytest.mark.asyncio
     async def test_concurrent_requests(self, mcp_client):
@@ -214,28 +197,25 @@ class TestMCPClientE2E:
         # 여러 요청을 동시에 보내기
         tasks = []
         for i in range(10):
-            task = mcp_client.request(
-                method="tools/call",
-                params={
-                    "name": "health_check",
-                    "arguments": {}
-                }
+            task = mcp_client.call_tool(
+                "health_check",
+                {}
             )
             tasks.append(task)
         
         # 모든 요청 완료 대기
-        responses = await asyncio.gather(*tasks)
+        results = await asyncio.gather(*tasks)
         
         # 모든 응답이 성공했는지 확인
-        for response in responses:
-            assert "result" in response
-            assert response["result"]["status"] in ["healthy", "degraded"]
+        for result in results:
+            assert result.data is not None
+            assert result.data["status"] in ["healthy", "degraded"]
 
 
 class TestMCPClientWithAuth:
     """인증이 필요한 프로파일 테스트"""
     
-    @pytest.fixture(scope="class")
+    @pytest.fixture(scope="function")
     async def auth_server_process(self):
         """AUTH 프로파일 서버 시작"""
         env = os.environ.copy()
@@ -301,7 +281,7 @@ class TestMCPClientWithAuth:
 class TestMCPClientWithCache:
     """캐싱 기능 테스트"""
     
-    @pytest.fixture(scope="class")
+    @pytest.fixture(scope="function")
     async def cached_server_process(self):
         """CACHED 프로파일 서버 시작"""
         env = os.environ.copy()

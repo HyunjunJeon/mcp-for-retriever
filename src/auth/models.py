@@ -1,51 +1,49 @@
 """
-인증 및 권한 관리 모델 정의
+인증 관련 모델 정의
 
-이 모듈은 MCP 서버의 인증/인가 시스템에서 사용하는 모든 데이터 모델을 정의합니다.
-Pydantic을 사용하여 타입 안전성과 자동 검증을 보장합니다.
+이 모듈은 사용자 인증, 권한 관리, 토큰 등과 관련된
+Pydantic 모델들을 정의합니다.
 
-주요 구성요소:
-    - ResourceType: 보호되는 리소스 타입 열거형
-    - ActionType: 리소스에 대한 작업 타입 열거형
-    - Permission: 개별 권한을 나타내는 모델
-    - Role: 권한의 집합인 역할 모델
-    - User: 사용자 정보 모델
-    - Token 관련 모델들: JWT 토큰 처리를 위한 모델들
+주요 모델:
+    - UserCreate: 사용자 생성 요청 모델
+    - UserLogin: 로그인 요청 모델  
+    - UserResponse: 사용자 정보 응답 모델
+    - AuthTokens: JWT 토큰 응답 모델
+    - Permission: 개별 권한 모델 (리소스 + 작업)
+    - Role: 역할 모델 (권한 그룹)
 
 작성일: 2024-01-30
 """
 
-from datetime import datetime, UTC
+from typing import Optional, Any
+from datetime import datetime
 from enum import Enum
-from typing import Optional
 
-from pydantic import BaseModel, EmailStr, Field, SecretStr, field_validator
+from pydantic import BaseModel, EmailStr, field_validator, Field
 
 
 class ResourceType(str, Enum):
     """
-    보호되는 리소스 타입 열거형
+    보호되는 리소스 타입
     
-    각 리트리버를 리소스로 정의하여 각각에 대한 접근 권한을 관리합니다.
-    새로운 리트리버가 추가될 때마다 여기에 타입을 추가해야 합니다.
+    시스템에서 권한 관리가 필요한 리소스들을 정의합니다.
     """
     
-    WEB_SEARCH = "web_search"   # 웹 검색 리트리버 (Tavily)
-    VECTOR_DB = "vector_db"     # 벡터 DB 리트리버 (Qdrant)
-    DATABASE = "database"       # 관계형 DB 리트리버 (PostgreSQL)
+    WEB_SEARCH = "web_search"
+    VECTOR_DB = "vector_db"
+    DATABASE = "database"
 
 
 class ActionType(str, Enum):
     """
-    리소스에 대한 작업 타입 열거형
+    리소스에 대한 작업 타입
     
-    각 리소스에 대해 수행할 수 있는 작업을 정의합니다.
-    CRUD 작업 중 CRD만 지원하며, Update는 Write로 통합됩니다.
+    각 리소스에 대해 수행할 수 있는 작업들을 정의합니다.
     """
     
-    READ = "read"       # 조회 권한 (검색, 읽기)
-    WRITE = "write"     # 수정 권한 (생성, 업데이트)
-    DELETE = "delete"   # 삭제 권한
+    READ = "read"
+    WRITE = "write"
+    DELETE = "delete"
 
 
 class Permission(BaseModel):
@@ -75,6 +73,38 @@ class Permission(BaseModel):
         return hash((self.resource, self.action))
 
 
+class ResourcePermission(BaseModel):
+    """
+    세밀한 리소스 권한 모델
+    
+    특정 collection이나 table에 대한 세밀한 권한을 정의합니다.
+    
+    Attributes:
+        resource_type: 리소스 타입 (VECTOR_DB, DATABASE)
+        resource_name: 리소스 이름 (예: "users.documents", "public.users")
+        actions: 허용된 작업 목록
+        conditions: 추가 조건 (선택사항)
+    """
+    
+    resource_type: ResourceType
+    resource_name: str = Field(..., description="Collection or table name with optional schema/namespace")
+    actions: list[ActionType]
+    conditions: Optional[dict[str, Any]] = None
+    
+    @field_validator('resource_name')
+    @classmethod
+    def validate_resource_name(cls, v: str) -> str:
+        """리소스 이름 검증"""
+        if not v or len(v) > 255:
+            raise ValueError("리소스 이름은 1-255자 사이여야 합니다")
+        
+        # SQL Injection 방지를 위한 기본 검증
+        if any(char in v for char in [';', '--', '/*', '*/', '\0']):
+            raise ValueError("리소스 이름에 허용되지 않는 문자가 포함되어 있습니다")
+        
+        return v
+
+
 class Role(BaseModel):
     """
     역할 모델 (RBAC - Role-Based Access Control)
@@ -98,178 +128,273 @@ class User(BaseModel):
     """
     사용자 정보 모델
     
-    시스템에 등록된 사용자의 전체 정보를 담는 모델입니다.
-    비밀번호는 해시화된 형태로만 저장됩니다.
+    시스템에 저장된 사용자의 전체 정보를 나타냅니다.
+    비밀번호는 해시된 형태로만 저장됩니다.
     
     Attributes:
-        id (str): 사용자 고유 식별자 (UUID)
-        email (EmailStr): 사용자 이메일 (로그인 ID로 사용)
-        hashed_password (str): 해시화된 비밀번호 (bcrypt)
-        is_active (bool): 계정 활성화 상태 (기본값: True)
-        roles (list[str]): 사용자가 가진 역할 이름 목록 (기본값: ["user"])
-        created_at (datetime): 계정 생성 시각 (UTC)
-        updated_at (Optional[datetime]): 마지막 수정 시각 (UTC)
+        id (int): 사용자 고유 ID
+        email (EmailStr): 이메일 주소 (로그인 ID로 사용)
+        username (Optional[str]): 사용자명 (표시용)
+        hashed_password (str): bcrypt로 해시된 비밀번호
+        is_active (bool): 계정 활성화 여부
+        is_verified (bool): 이메일 인증 여부
+        roles (list[str]): 사용자가 가진 역할 목록
+        created_at (datetime): 계정 생성 시각
+        updated_at (datetime): 정보 수정 시각
     """
     
-    id: str
+    id: int
     email: EmailStr
+    username: Optional[str] = None
     hashed_password: str
     is_active: bool = True
+    is_verified: bool = False
     roles: list[str] = Field(default_factory=lambda: ["user"])
-    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
-    updated_at: Optional[datetime] = None
+    created_at: datetime
+    updated_at: datetime
 
 
 class UserCreate(BaseModel):
     """
     사용자 생성 요청 모델
     
-    새로운 사용자를 등록할 때 필요한 정보를 정의합니다.
-    비밀번호는 SecretStr로 처리하여 로그에 노출되지 않도록 합니다.
+    회원가입 시 클라이언트가 제공해야 하는 정보입니다.
     
     Attributes:
-        email (EmailStr): 사용자 이메일 (유효한 이메일 형식이어야 함)
-        password (SecretStr): 비밀번호 (최소 8자 이상)
-        roles (list[str]): 부여할 역할 목록 (기본값: ["user"])
+        email (EmailStr): 이메일 주소 (중복 불가)
+        password (str): 평문 비밀번호 (최소 8자, 대소문자/숫자 포함)
+        username (Optional[str]): 사용자명 (선택사항)
+        roles (Optional[list[str]]): 초기 역할 (관리자만 설정 가능)
     """
     
     email: EmailStr
-    password: SecretStr = Field(..., min_length=8)
-    roles: list[str] = Field(default_factory=lambda: ["user"])
+    password: str = Field(..., min_length=8, max_length=128)
+    username: Optional[str] = Field(None, min_length=3, max_length=50)
+    roles: Optional[list[str]] = None
     
-    @field_validator("password")
+    @field_validator('password')
     @classmethod
-    def validate_password(cls, v: SecretStr) -> SecretStr:
+    def validate_password(cls, v: str) -> str:
         """
         비밀번호 복잡도 검증
         
-        보안을 위해 비밀번호가 최소 요구사항을 충족하는지 확인합니다.
-        
-        요구사항:
         - 최소 8자 이상
         - 대문자 포함
         - 소문자 포함
         - 숫자 포함
         
         Args:
-            v (SecretStr): 검증할 비밀번호
+            v: 검증할 비밀번호
             
         Returns:
-            SecretStr: 검증을 통과한 비밀번호
+            str: 검증된 비밀번호
             
         Raises:
             ValueError: 비밀번호가 요구사항을 충족하지 않을 때
         """
-        password = v.get_secret_value()
-        
-        # 최소 길이 확인 (Field 검증과 중복이지만 명확성을 위해 유지)
-        if len(password) < 8:
-            raise ValueError("비밀번호는 최소 8자 이상이어야 합니다")
-        
-        # 대문자, 소문자, 숫자 포함 확인
-        has_upper = any(c.isupper() for c in password)
-        has_lower = any(c.islower() for c in password)
-        has_digit = any(c.isdigit() for c in password)
-        
-        if not (has_upper and has_lower and has_digit):
-            raise ValueError(
-                "비밀번호는 대문자, 소문자, 숫자를 포함해야 합니다"
-            )
-        
+        if not any(char.isupper() for char in v):
+            raise ValueError('비밀번호는 대문자를 포함해야 합니다')
+        if not any(char.islower() for char in v):
+            raise ValueError('비밀번호는 소문자를 포함해야 합니다')
+        if not any(char.isdigit() for char in v):
+            raise ValueError('비밀번호는 숫자를 포함해야 합니다')
         return v
 
 
 class UserLogin(BaseModel):
     """
-    사용자 로그인 요청 모델
+    로그인 요청 모델
     
-    로그인 시 필요한 인증 정보를 정의합니다.
+    사용자가 로그인할 때 제공해야 하는 정보입니다.
     
     Attributes:
-        email (EmailStr): 로그인할 사용자의 이메일
-        password (SecretStr): 비밀번호
+        email (EmailStr): 이메일 주소
+        password (str): 평문 비밀번호
     """
     
     email: EmailStr
-    password: SecretStr
+    password: str
 
 
 class UserResponse(BaseModel):
     """
     사용자 정보 응답 모델
     
-    API 응답으로 사용자 정보를 반환할 때 사용하는 모델입니다.
-    보안상 비밀번호 해시는 포함하지 않습니다.
+    API 응답으로 반환되는 사용자 정보입니다.
+    민감한 정보(비밀번호 등)는 제외됩니다.
     
     Attributes:
-        id (str): 사용자 고유 식별자
-        email (EmailStr): 사용자 이메일
-        is_active (bool): 계정 활성화 상태
+        id (int): 사용자 고유 ID
+        email (EmailStr): 이메일 주소
+        username (Optional[str]): 사용자명
+        is_active (bool): 계정 활성화 여부
+        is_verified (bool): 이메일 인증 여부
         roles (list[str]): 사용자가 가진 역할 목록
         created_at (datetime): 계정 생성 시각
-        updated_at (Optional[datetime]): 마지막 수정 시각
     """
     
-    id: str
+    id: int
     email: EmailStr
+    username: Optional[str] = None
     is_active: bool
+    is_verified: bool
     roles: list[str]
     created_at: datetime
-    updated_at: Optional[datetime] = None
+    
+    class Config:
+        """Pydantic 설정"""
+        from_attributes = True  # ORM 모델에서 직접 변환 가능
+
+
+class UserUpdate(BaseModel):
+    """
+    사용자 정보 수정 요청 모델
+    
+    사용자가 자신의 정보를 수정할 때 사용합니다.
+    모든 필드는 선택사항입니다.
+    
+    Attributes:
+        username (Optional[str]): 새 사용자명
+        password (Optional[str]): 새 비밀번호
+    """
+    
+    username: Optional[str] = Field(None, min_length=3, max_length=50)
+    password: Optional[str] = Field(None, min_length=8, max_length=128)
+    
+    @field_validator('password')
+    @classmethod
+    def validate_password(cls, v: Optional[str]) -> Optional[str]:
+        """비밀번호 복잡도 검증 (UserCreate와 동일)"""
+        if v is None:
+            return v
+            
+        if not any(char.isupper() for char in v):
+            raise ValueError('비밀번호는 대문자를 포함해야 합니다')
+        if not any(char.islower() for char in v):
+            raise ValueError('비밀번호는 소문자를 포함해야 합니다')
+        if not any(char.isdigit() for char in v):
+            raise ValueError('비밀번호는 숫자를 포함해야 합니다')
+        return v
+
+
+class AuthTokens(BaseModel):
+    """
+    JWT 토큰 응답 모델
+    
+    로그인 성공 시 반환되는 토큰 정보입니다.
+    
+    Attributes:
+        access_token (str): API 접근용 토큰 (단기 유효)
+        refresh_token (str): 토큰 갱신용 토큰 (장기 유효)
+        token_type (str): 토큰 타입 (항상 "bearer")
+        expires_in (int): 액세스 토큰 만료 시간 (초)
+    """
+    
+    access_token: str
+    refresh_token: str
+    token_type: str = "bearer"
+    expires_in: int
 
 
 class TokenData(BaseModel):
     """
     JWT 토큰 페이로드 데이터 모델
     
-    JWT 토큰의 페이로드에 포함되는 사용자 정보를 정의합니다.
-    이 정보는 토큰에서 추출하거나 토큰을 생성할 때 사용됩니다.
+    JWT 토큰의 페이로드에 포함된 사용자 정보를 나타냅니다.
     
     Attributes:
-        user_id (str): 사용자 고유 식별자 (필수)
-        email (Optional[EmailStr]): 사용자 이메일 (선택사항)
-        roles (list[str]): 사용자 역할 목록 (기본값: 빈 리스트)
-        token_type (str): 토큰 타입 ("access" 또는 "refresh", 기본값: "access")
-        exp (Optional[datetime]): 토큰 만료 시각 (expiration)
-        iat (Optional[datetime]): 토큰 발급 시각 (issued at)
+        user_id (str): 사용자 고유 ID
+        email (Optional[str]): 사용자 이메일
+        roles (list[str]): 사용자 역할 목록
+        token_type (str): 토큰 타입 (access/refresh)
+        exp (Optional[datetime]): 토큰 만료 시간
+        iat (Optional[datetime]): 토큰 발급 시간
     """
     
     user_id: str
-    email: Optional[EmailStr] = None
+    email: Optional[str] = None
     roles: list[str] = Field(default_factory=list)
-    token_type: str = "access"
+    token_type: str
     exp: Optional[datetime] = None
     iat: Optional[datetime] = None
 
 
-class AuthTokens(BaseModel):
+class TokenRefresh(BaseModel):
     """
-    인증 토큰 쌍 응답 모델
+    토큰 갱신 요청 모델
     
-    로그인 성공 시 반환되는 액세스 토큰과 리프레시 토큰을 포함합니다.
+    만료된 액세스 토큰을 갱신할 때 사용합니다.
     
     Attributes:
-        access_token (str): API 요청에 사용하는 액세스 토큰 (짧은 수명)
-        refresh_token (str): 액세스 토큰 갱신에 사용하는 리프레시 토큰 (긴 수명)
-        token_type (str): 토큰 인증 방식 (고정값: "Bearer")
+        refresh_token (str): 유효한 리프레시 토큰
     """
     
-    access_token: str
     refresh_token: str
-    token_type: str = "Bearer"
 
 
-class TokenResponse(BaseModel):
+class PasswordReset(BaseModel):
     """
-    단일 토큰 응답 모델
+    비밀번호 재설정 요청 모델
     
-    토큰 갱신 시 또는 액세스 토큰만 필요한 경우 사용하는 모델입니다.
-    OAuth2 표준을 따릅니다.
+    비밀번호를 잊어버린 경우 재설정을 요청합니다.
     
     Attributes:
-        access_token (str): API 요청에 사용하는 액세스 토큰
-        token_type (str): 토큰 인증 방식 (고정값: "Bearer")
+        email (EmailStr): 계정 이메일 주소
     """
     
-    access_token: str
-    token_type: str = "Bearer"
+    email: EmailStr
+
+
+class PasswordResetConfirm(BaseModel):
+    """
+    비밀번호 재설정 확인 모델
+    
+    이메일로 받은 토큰으로 새 비밀번호를 설정합니다.
+    
+    Attributes:
+        token (str): 이메일로 받은 재설정 토큰
+        new_password (str): 새 비밀번호
+    """
+    
+    token: str
+    new_password: str = Field(..., min_length=8, max_length=128)
+    
+    @field_validator('new_password')
+    @classmethod
+    def validate_password(cls, v: str) -> str:
+        """비밀번호 복잡도 검증 (UserCreate와 동일)"""
+        if not any(char.isupper() for char in v):
+            raise ValueError('비밀번호는 대문자를 포함해야 합니다')
+        if not any(char.islower() for char in v):
+            raise ValueError('비밀번호는 소문자를 포함해야 합니다')
+        if not any(char.isdigit() for char in v):
+            raise ValueError('비밀번호는 숫자를 포함해야 합니다')
+        return v
+
+
+__all__ = [
+    # 열거형
+    "ResourceType",
+    "ActionType",
+    
+    # 권한 모델
+    "Permission",
+    "ResourcePermission",
+    "Role",
+    
+    # 사용자 모델
+    "User",
+    "UserCreate",
+    "UserLogin",
+    "UserResponse",
+    "UserUpdate",
+    
+    # 토큰 모델
+    "AuthTokens",
+    "TokenData",
+    "TokenRefresh",
+    
+    # 비밀번호 재설정
+    "PasswordReset",
+    "PasswordResetConfirm",
+]

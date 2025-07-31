@@ -202,14 +202,14 @@ class AuthService:
         if existing_user:
             raise AuthenticationError(f"이미 등록된 이메일입니다: {user_create.email}")
         
-        # 비밀번호 안전한 해싱 (SecretStr에서 값 추출 후 해싱)
-        hashed_password = self.hash_password(user_create.password.get_secret_value())
+        # 비밀번호 안전한 해싱
+        hashed_password = self.hash_password(user_create.password)
         
         # 사용자 데이터 준비 (ID는 repository에서 자동 생성)
         user_data = {
             "email": user_create.email,
             "hashed_password": hashed_password,
-            "roles": user_create.roles,
+            "roles": user_create.roles or ["user"],  # None인 경우 기본값 설정
         }
         
         # 데이터베이스에 사용자 생성
@@ -228,9 +228,9 @@ class AuthService:
             id=user.id,
             email=user.email,
             is_active=user.is_active,
+            is_verified=user.is_verified,
             roles=user.roles,
             created_at=user.created_at,
-            updated_at=user.updated_at,
         )
     
     async def login(self, user_login: UserLogin) -> AuthTokens:
@@ -277,7 +277,7 @@ class AuthService:
         
         # 2단계: 비밀번호 검증 (bcrypt 상수 시간 비교)
         if not self.verify_password(
-            user_login.password.get_secret_value(),
+            user_login.password,
             user.hashed_password,
         ):
             # 보안: 비밀번호 실패도 로깅하되 일반적인 에러 메시지 반환
@@ -310,6 +310,7 @@ class AuthService:
         return AuthTokens(
             access_token=access_token,
             refresh_token=refresh_token,
+            expires_in=self.jwt_service.access_token_expire_minutes * 60,  # 분을 초로 변환
         )
     
     async def refresh_tokens(self, refresh_token: str) -> AuthTokens:
@@ -384,6 +385,7 @@ class AuthService:
         return AuthTokens(
             access_token=new_access_token,
             refresh_token=refresh_token,  # 리프레시 토큰은 재사용 (보안상 문제없음)
+            expires_in=self.jwt_service.access_token_expire_minutes * 60,  # 분을 초로 변환
         )
     
     async def get_current_user(self, token: str) -> UserResponse:
@@ -450,9 +452,9 @@ class AuthService:
             id=user.id,
             email=user.email,
             is_active=user.is_active,
+            is_verified=user.is_verified,
             roles=user.roles,
             created_at=user.created_at,
-            updated_at=user.updated_at,
         )
     
     async def search_users(self, query: str, limit: int = 10) -> list[UserResponse]:
@@ -472,9 +474,9 @@ class AuthService:
                 id=user.id,
                 email=user.email,
                 is_active=user.is_active,
+                is_verified=user.is_verified,
                 roles=user.roles,
                 created_at=user.created_at,
-                updated_at=user.updated_at,
             )
             for user in users
         ]
@@ -496,9 +498,9 @@ class AuthService:
             id=user.id,
             email=user.email,
             is_active=user.is_active,
+            is_verified=user.is_verified,
             roles=user.roles,
             created_at=user.created_at,
-            updated_at=user.updated_at,
         )
     
     async def get_recent_users(self, limit: int = 10) -> list[UserResponse]:
@@ -517,9 +519,9 @@ class AuthService:
                 id=user.id,
                 email=user.email,
                 is_active=user.is_active,
+                is_verified=user.is_verified,
                 roles=user.roles,
                 created_at=user.created_at,
-                updated_at=user.updated_at,
             )
             for user in users
         ]
@@ -541,9 +543,9 @@ class AuthService:
                 id=user.id,
                 email=user.email,
                 is_active=user.is_active,
+                is_verified=user.is_verified,
                 roles=user.roles,
                 created_at=user.created_at,
-                updated_at=user.updated_at,
             )
             for user in users
         ]

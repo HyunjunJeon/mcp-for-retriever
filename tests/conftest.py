@@ -6,8 +6,8 @@ import os
 from typing import Dict, Any, AsyncGenerator
 from unittest.mock import Mock, AsyncMock, patch
 
-# Configure pytest-asyncio
-pytest_plugins = ["pytest_asyncio"]
+# Configure pytest-asyncio and pytest-playwright
+pytest_plugins = ["pytest_asyncio", "pytest_playwright"]
 
 
 @pytest.fixture(scope="session")
@@ -169,6 +169,9 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers", "observability: mark test as testing observability features"
     )
+    config.addinivalue_line(
+        "markers", "playwright: mark test as requiring Playwright browser"
+    )
 
 
 # Environment setup
@@ -184,3 +187,44 @@ def setup_test_environment():
     
     with patch.dict(os.environ, test_env):
         yield
+
+
+# Playwright fixtures
+@pytest.fixture(scope="session")
+def browser_context_args(browser_context_args):
+    """Configure browser context for all tests."""
+    return {
+        **browser_context_args,
+        "viewport": {"width": 1280, "height": 720},
+        "ignore_https_errors": True,
+    }
+
+
+@pytest.fixture
+def playwright_headless():
+    """Control headless mode via environment variable."""
+    return os.getenv("PLAYWRIGHT_HEADLESS", "true").lower() == "true"
+
+
+@pytest.fixture
+async def auth_page(page):
+    """Create a page with auth server URL configured."""
+    auth_url = os.getenv("AUTH_URL", "http://localhost:8000")
+    page.auth_url = auth_url
+    yield page
+
+
+@pytest.fixture
+async def mcp_page(page):
+    """Create a page with MCP server URL configured."""
+    mcp_url = os.getenv("MCP_URL", "http://localhost:8001")
+    page.mcp_url = mcp_url
+    yield page
+
+
+@pytest.fixture
+async def authenticated_page(auth_page):
+    """Create a page with authentication already completed."""
+    # This will be implemented when we create the auth flow
+    # For now, just return the page
+    yield auth_page

@@ -1,9 +1,12 @@
 """Error handling middleware for MCP server."""
 
 from typing import Any, Callable, Dict
+import asyncio
 import structlog
 import traceback
 from datetime import datetime
+
+from fastmcp.server.middleware import Middleware, MiddlewareContext, CallNext
 
 from src.exceptions import (
     MCPError,
@@ -20,7 +23,7 @@ from src.exceptions import (
 logger = structlog.get_logger(__name__)
 
 
-class ErrorHandlerMiddleware:
+class ErrorHandlerMiddleware(Middleware):
     """Middleware for handling and logging errors consistently."""
     
     def __init__(
@@ -47,49 +50,29 @@ class ErrorHandlerMiddleware:
             "by_method": {}
         }
     
-    async def __call__(self, request: Dict[str, Any], call_next: Callable) -> Dict[str, Any]:
+    async def on_message(self, context: MiddlewareContext, call_next: CallNext) -> Any:
         """Handle errors from downstream handlers."""
-        request_id = request.get("request_id", "unknown")
-        method = request.get("method", "unknown")
-        user = request.get("user", {})
+        method = context.method or "unknown"
+        request_id = getattr(context, 'request_id', None) or f"req-{id(context)}"
+        user = getattr(context, 'user', {})
         
         try:
             # Process request
-            response = await call_next(request)
-            
-            # Check if response contains an error
-            if isinstance(response, dict) and "error" in response:
-                await self._handle_response_error(response, request_id, method, user)
+            response = await call_next(context)
             
             return response
             
         except MCPError as e:
             # Our custom errors - handle gracefully
             await self._log_mcp_error(e, request_id, method, user)
-            return ErrorHandler.handle_error(e, request_id)
-            
-        except asyncio.TimeoutError as e:
-            # Timeout errors
-            timeout_error = TimeoutError(
-                message="Request processing timed out",
-                operation=method
-            )
-            await self._log_error(timeout_error, request_id, method, user, is_timeout=True)
-            return ErrorHandler.handle_error(timeout_error, request_id)
+            raise  # Re-raise for FastMCP to handle properly
             
         except Exception as e:
             # Unexpected errors - log with full details
             await self._log_unexpected_error(e, request_id, method, user)
             
-            # Convert to internal error for response
-            if self.include_error_details:
-                error_response = ErrorHandler.handle_error(e, request_id)
-            else:
-                # Hide internal details in production
-                generic_error = MCPError("Internal server error")
-                error_response = ErrorHandler.handle_error(generic_error, request_id)
-            
-            return error_response
+            # Re-raise to let FastMCP handle the error response format
+            raise
     
     async def _handle_response_error(
         self,

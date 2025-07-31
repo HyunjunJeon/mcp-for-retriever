@@ -175,7 +175,7 @@ class JWTService:
         
         # JWT 페이로드 구성 (표준 + 커스텀 클레임)
         payload = {
-            "sub": user_id,        # Subject (사용자 식별자)
+            "sub": str(user_id),        # Subject (사용자 식별자) - JWT 표준에 따라 문자열이어야 함
             "email": email,        # 사용자 이메일
             "roles": roles,        # 권한 역할 목록
             "type": "access",      # 토큰 타입 (액세스)
@@ -214,7 +214,7 @@ class JWTService:
         expire = now + timedelta(minutes=self.refresh_token_expire_minutes)
         
         payload = {
-            "sub": user_id,
+            "sub": str(user_id),  # JWT sub는 문자열이어야 함
             "type": "refresh",
             "exp": expire,
             "iat": now,

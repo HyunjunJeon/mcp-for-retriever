@@ -86,7 +86,8 @@ from typing import Annotated
 
 from fastapi import FastAPI, Depends, HTTPException, status, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse
+from sse_starlette.sse import EventSourceResponse
 import structlog
 import uvicorn
 
@@ -310,6 +311,510 @@ async def get_me(
     return current_user
 
 
+# === HTML UI 페이지 엔드포인트 (E2E 테스트용) ===
+
+@app.get("/auth/register-page", response_class=HTMLResponse)
+async def register_page():
+    """회원가입 페이지 (E2E 테스트용)"""
+    html_content = """
+    <!DOCTYPE html>
+    <html lang="ko">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>MCP 회원가입</title>
+        <style>
+            body { font-family: Arial, sans-serif; max-width: 500px; margin: 50px auto; padding: 20px; }
+            .form-group { margin-bottom: 15px; }
+            label { display: block; margin-bottom: 5px; font-weight: bold; }
+            input { width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px; }
+            button { background-color: #007bff; color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; }
+            button:hover { background-color: #0056b3; }
+            .error { color: red; margin-top: 10px; }
+            .success { color: green; margin-top: 10px; }
+        </style>
+    </head>
+    <body>
+        <h1>MCP 회원가입</h1>
+        <form id="registerForm">
+            <div class="form-group">
+                <label for="email">이메일:</label>
+                <input type="email" id="email" name="email" required>
+            </div>
+            <div class="form-group">
+                <label for="password">비밀번호:</label>
+                <input type="password" id="password" name="password" required minlength="6">
+            </div>
+            <button type="submit">회원가입</button>
+        </form>
+        <div id="message"></div>
+        <p>이미 계정이 있으신가요? <a href="/auth/login-page">로그인</a></p>
+        
+        <script>
+            document.getElementById('registerForm').addEventListener('submit', async (e) => {
+                e.preventDefault();
+                const messageDiv = document.getElementById('message');
+                
+                const formData = {
+                    email: document.getElementById('email').value,
+                    password: document.getElementById('password').value
+                };
+                
+                try {
+                    const response = await fetch('/auth/register', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(formData)
+                    });
+                    
+                    const data = await response.json();
+                    
+                    if (response.ok) {
+                        messageDiv.innerHTML = '<p class="success">회원가입 성공! <a href="/auth/login-page">로그인 페이지</a>로 이동하세요.</p>';
+                        document.getElementById('registerForm').reset();
+                    } else {
+                        const errorMessage = data.detail || data.message || JSON.stringify(data);
+                        messageDiv.innerHTML = `<p class="error">오류: ${errorMessage}</p>`;
+                    }
+                } catch (error) {
+                    messageDiv.innerHTML = '<p class="error">네트워크 오류가 발생했습니다.</p>';
+                }
+            });
+        </script>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html_content)
+
+
+@app.get("/auth/login-page", response_class=HTMLResponse)
+async def login_page():
+    """로그인 페이지 (E2E 테스트용)"""
+    html_content = """
+    <!DOCTYPE html>
+    <html lang="ko">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>MCP 로그인</title>
+        <style>
+            body { font-family: Arial, sans-serif; max-width: 500px; margin: 50px auto; padding: 20px; }
+            .form-group { margin-bottom: 15px; }
+            label { display: block; margin-bottom: 5px; font-weight: bold; }
+            input { width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px; }
+            button { background-color: #007bff; color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; }
+            button:hover { background-color: #0056b3; }
+            .error { color: red; margin-top: 10px; }
+            .success { color: green; margin-top: 10px; }
+            .token-info { background-color: #f8f9fa; padding: 15px; border-radius: 4px; margin-top: 20px; word-break: break-all; }
+        </style>
+    </head>
+    <body>
+        <h1>MCP 로그인</h1>
+        <form id="loginForm">
+            <div class="form-group">
+                <label for="email">이메일:</label>
+                <input type="email" id="email" name="email" required>
+            </div>
+            <div class="form-group">
+                <label for="password">비밀번호:</label>
+                <input type="password" id="password" name="password" required>
+            </div>
+            <button type="submit">로그인</button>
+        </form>
+        <div id="message"></div>
+        <div id="tokenInfo" style="display: none;">
+            <h3>인증 토큰 정보</h3>
+            <div class="token-info">
+                <strong>Access Token:</strong>
+                <p id="accessToken"></p>
+                <strong>Refresh Token:</strong>
+                <p id="refreshToken"></p>
+            </div>
+            <button onclick="testAuthMe()">현재 사용자 정보 조회</button>
+        </div>
+        <p>계정이 없으신가요? <a href="/auth/register-page">회원가입</a></p>
+        
+        <script>
+            let currentAccessToken = null;
+            
+            document.getElementById('loginForm').addEventListener('submit', async (e) => {
+                e.preventDefault();
+                const messageDiv = document.getElementById('message');
+                const tokenInfoDiv = document.getElementById('tokenInfo');
+                
+                const formData = {
+                    email: document.getElementById('email').value,
+                    password: document.getElementById('password').value
+                };
+                
+                try {
+                    const response = await fetch('/auth/login', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(formData)
+                    });
+                    
+                    const data = await response.json();
+                    
+                    if (response.ok) {
+                        messageDiv.innerHTML = '<p class="success">로그인 성공!</p>';
+                        document.getElementById('loginForm').reset();
+                        
+                        // 토큰 정보 표시
+                        currentAccessToken = data.access_token;
+                        document.getElementById('accessToken').textContent = data.access_token;
+                        document.getElementById('refreshToken').textContent = data.refresh_token;
+                        tokenInfoDiv.style.display = 'block';
+                        
+                        // 로컬 스토리지에 토큰 저장 (E2E 테스트용)
+                        localStorage.setItem('access_token', data.access_token);
+                        localStorage.setItem('refresh_token', data.refresh_token);
+                    } else {
+                        const errorMessage = data.detail || data.message || JSON.stringify(data);
+                        messageDiv.innerHTML = `<p class="error">오류: ${errorMessage}</p>`;
+                        tokenInfoDiv.style.display = 'none';
+                    }
+                } catch (error) {
+                    messageDiv.innerHTML = '<p class="error">네트워크 오류가 발생했습니다.</p>';
+                    tokenInfoDiv.style.display = 'none';
+                }
+            });
+            
+            async function testAuthMe() {
+                const messageDiv = document.getElementById('message');
+                
+                if (!currentAccessToken) {
+                    messageDiv.innerHTML = '<p class="error">먼저 로그인하세요.</p>';
+                    return;
+                }
+                
+                try {
+                    const response = await fetch('/auth/me', {
+                        headers: { 'Authorization': `Bearer ${currentAccessToken}` }
+                    });
+                    
+                    if (response.ok) {
+                        const userData = await response.json();
+                        messageDiv.innerHTML = `<p class="success">사용자 정보: ${JSON.stringify(userData, null, 2)}</p>`;
+                    } else {
+                        messageDiv.innerHTML = '<p class="error">인증 실패: 토큰이 유효하지 않습니다.</p>';
+                    }
+                } catch (error) {
+                    messageDiv.innerHTML = '<p class="error">네트워크 오류가 발생했습니다.</p>';
+                }
+            }
+        </script>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html_content)
+
+
+@app.get("/mcp/client-page", response_class=HTMLResponse)
+async def mcp_client_page():
+    """MCP 클라이언트 테스트 페이지 (E2E 테스트용)"""
+    html_content = """
+    <!DOCTYPE html>
+    <html lang="ko">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>MCP 클라이언트 테스트</title>
+        <style>
+            body { font-family: Arial, sans-serif; max-width: 1200px; margin: 20px auto; padding: 20px; }
+            .container { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+            .section { border: 1px solid #ddd; padding: 20px; border-radius: 8px; }
+            h1, h2 { color: #333; }
+            .form-group { margin-bottom: 15px; }
+            label { display: block; margin-bottom: 5px; font-weight: bold; }
+            input, select, textarea { width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px; }
+            textarea { min-height: 100px; font-family: monospace; }
+            button { background-color: #007bff; color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; margin-right: 10px; }
+            button:hover { background-color: #0056b3; }
+            button:disabled { background-color: #ccc; cursor: not-allowed; }
+            .error { color: red; }
+            .success { color: green; }
+            .result { background-color: #f8f9fa; padding: 15px; border-radius: 4px; margin-top: 15px; }
+            .json { white-space: pre-wrap; font-family: monospace; font-size: 14px; }
+            .tool-item { padding: 10px; margin: 5px 0; background: #e9ecef; border-radius: 4px; cursor: pointer; }
+            .tool-item:hover { background: #dee2e6; }
+            .tool-name { font-weight: bold; }
+            .tool-description { font-size: 14px; color: #666; }
+            #loginStatus { padding: 10px; margin-bottom: 20px; border-radius: 4px; }
+            #loginStatus.success { background-color: #d4edda; color: #155724; }
+            #loginStatus.error { background-color: #f8d7da; color: #721c24; }
+        </style>
+    </head>
+    <body>
+        <h1>MCP 클라이언트 테스트</h1>
+        
+        <div id="loginStatus"></div>
+        
+        <div class="container">
+            <div class="section">
+                <h2>인증 정보</h2>
+                <div class="form-group">
+                    <label for="accessToken">Access Token:</label>
+                    <textarea id="accessToken" placeholder="로그인 후 자동으로 채워집니다"></textarea>
+                </div>
+                <button onclick="loadTokenFromStorage()">로컬 스토리지에서 토큰 불러오기</button>
+                <button onclick="clearAuth()">인증 정보 초기화</button>
+            </div>
+            
+            <div class="section">
+                <h2>MCP 요청</h2>
+                <div class="form-group">
+                    <label for="method">메서드:</label>
+                    <select id="method" onchange="updateParamsTemplate()">
+                        <option value="tools/list">tools/list - 도구 목록 조회</option>
+                        <option value="tools/call">tools/call - 도구 호출</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label for="params">파라미터 (JSON):</label>
+                    <textarea id="params">{}</textarea>
+                </div>
+                <button onclick="sendMCPRequest()">요청 전송</button>
+                <button onclick="clearResults()">결과 초기화</button>
+            </div>
+        </div>
+        
+        <div class="section" style="margin-top: 20px;">
+            <h2>도구 목록</h2>
+            <div id="toolsList"></div>
+        </div>
+        
+        <div class="section" style="margin-top: 20px;">
+            <h2>응답 결과</h2>
+            <div id="results"></div>
+        </div>
+        
+        <script>
+            // MCP 클라이언트 클래스
+            class MCPClient {
+                constructor(baseUrl, token) {
+                    this.baseUrl = baseUrl;
+                    this.token = token;
+                    this.requestId = 1;
+                }
+                
+                async sendRequest(method, params = {}) {
+                    const request = {
+                        jsonrpc: "2.0",
+                        id: this.requestId++,
+                        method: method,
+                        params: params
+                    };
+                    
+                    try {
+                        const response = await fetch(`${this.baseUrl}/mcp/proxy`, {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json',
+                                'Authorization': `Bearer ${this.token}`
+                            },
+                            body: JSON.stringify(request)
+                        });
+                        
+                        if (!response.ok) {
+                            const error = await response.text();
+                            throw new Error(`HTTP ${response.status}: ${error}`);
+                        }
+                        
+                        return await response.json();
+                    } catch (error) {
+                        throw error;
+                    }
+                }
+                
+                async listTools() {
+                    return await this.sendRequest('tools/list');
+                }
+                
+                async callTool(name, args = {}) {
+                    return await this.sendRequest('tools/call', { name, arguments: args });
+                }
+            }
+            
+            let mcpClient = null;
+            
+            // 페이지 로드 시 토큰 확인
+            window.addEventListener('DOMContentLoaded', () => {
+                loadTokenFromStorage();
+            });
+            
+            function loadTokenFromStorage() {
+                const token = localStorage.getItem('access_token');
+                if (token) {
+                    document.getElementById('accessToken').value = token;
+                    mcpClient = new MCPClient('', token);
+                    updateLoginStatus('토큰이 로드되었습니다. MCP 요청을 보낼 수 있습니다.', 'success');
+                    // 자동으로 도구 목록 로드
+                    loadToolsList();
+                } else {
+                    updateLoginStatus('로그인이 필요합니다. 먼저 로그인 페이지에서 로그인하세요.', 'error');
+                }
+            }
+            
+            function updateLoginStatus(message, type) {
+                const statusDiv = document.getElementById('loginStatus');
+                statusDiv.textContent = message;
+                statusDiv.className = type;
+            }
+            
+            function clearAuth() {
+                document.getElementById('accessToken').value = '';
+                localStorage.removeItem('access_token');
+                mcpClient = null;
+                updateLoginStatus('인증 정보가 초기화되었습니다.', 'error');
+                document.getElementById('toolsList').innerHTML = '';
+            }
+            
+            function updateParamsTemplate() {
+                const method = document.getElementById('method').value;
+                const paramsTextarea = document.getElementById('params');
+                
+                if (method === 'tools/list') {
+                    paramsTextarea.value = '{}';
+                } else if (method === 'tools/call') {
+                    paramsTextarea.value = JSON.stringify({
+                        name: 'search_web',
+                        arguments: {
+                            query: 'MCP protocol',
+                            limit: 5
+                        }
+                    }, null, 2);
+                }
+            }
+            
+            async function sendMCPRequest() {
+                const token = document.getElementById('accessToken').value;
+                if (!token) {
+                    alert('Access Token이 필요합니다.');
+                    return;
+                }
+                
+                const method = document.getElementById('method').value;
+                let params;
+                
+                try {
+                    params = JSON.parse(document.getElementById('params').value);
+                } catch (e) {
+                    alert('파라미터가 올바른 JSON 형식이 아닙니다.');
+                    return;
+                }
+                
+                mcpClient = new MCPClient('', token);
+                
+                try {
+                    showResult('요청 전송 중...', 'info');
+                    const response = await mcpClient.sendRequest(method, params);
+                    showResult(JSON.stringify(response, null, 2), 'success');
+                    
+                    // tools/list 응답이면 도구 목록 업데이트
+                    if (method === 'tools/list' && response.result && response.result.tools) {
+                        displayTools(response.result.tools);
+                    }
+                } catch (error) {
+                    showResult(`오류: ${error.message}`, 'error');
+                }
+            }
+            
+            async function loadToolsList() {
+                if (!mcpClient) return;
+                
+                try {
+                    const response = await mcpClient.listTools();
+                    if (response.result && response.result.tools) {
+                        displayTools(response.result.tools);
+                    }
+                } catch (error) {
+                    console.error('도구 목록 로드 실패:', error);
+                }
+            }
+            
+            function displayTools(tools) {
+                const toolsList = document.getElementById('toolsList');
+                toolsList.innerHTML = '';
+                
+                tools.forEach(tool => {
+                    const toolItem = document.createElement('div');
+                    toolItem.className = 'tool-item';
+                    toolItem.innerHTML = `
+                        <div class="tool-name">${tool.name}</div>
+                        <div class="tool-description">${tool.description || '설명 없음'}</div>
+                    `;
+                    toolItem.onclick = () => selectTool(tool.name);
+                    toolsList.appendChild(toolItem);
+                });
+            }
+            
+            function selectTool(toolName) {
+                document.getElementById('method').value = 'tools/call';
+                const exampleParams = {
+                    search_web: {
+                        name: 'search_web',
+                        arguments: {
+                            query: 'FastMCP tutorial',
+                            limit: 5
+                        }
+                    },
+                    search_vectors: {
+                        name: 'search_vectors',
+                        arguments: {
+                            query: 'machine learning',
+                            collection: 'documents',
+                            limit: 10
+                        }
+                    },
+                    search_database: {
+                        name: 'search_database',
+                        arguments: {
+                            query: 'SELECT * FROM users LIMIT 5'
+                        }
+                    },
+                    search_all: {
+                        name: 'search_all',
+                        arguments: {
+                            query: 'AI technology',
+                            limit: 3
+                        }
+                    }
+                };
+                
+                const params = exampleParams[toolName] || {
+                    name: toolName,
+                    arguments: {}
+                };
+                
+                document.getElementById('params').value = JSON.stringify(params, null, 2);
+            }
+            
+            function showResult(message, type) {
+                const resultsDiv = document.getElementById('results');
+                const resultDiv = document.createElement('div');
+                resultDiv.className = `result ${type}`;
+                
+                const timestamp = new Date().toLocaleTimeString();
+                resultDiv.innerHTML = `
+                    <strong>[${timestamp}]</strong>
+                    <pre class="json">${message}</pre>
+                `;
+                
+                resultsDiv.insertBefore(resultDiv, resultsDiv.firstChild);
+            }
+            
+            function clearResults() {
+                document.getElementById('results').innerHTML = '';
+            }
+        </script>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html_content)
+
+
 # === MCP 프록시 엔드포인트 ===
 
 @app.post("/mcp/proxy", response_model=MCPResponse)
@@ -366,6 +871,7 @@ async def proxy_mcp_request(
     response = await mcp_proxy.forward_request(
         request=request,
         user_roles=current_user.roles,
+        user_id=current_user.id,
     )
     
     # 에러 로깅
@@ -395,9 +901,46 @@ async def proxy_batch_mcp_requests(
     responses = await mcp_proxy.batch_forward_requests(
         requests=requests,
         user_roles=current_user.roles,
+        user_id=current_user.id,
     )
     
     return responses
+
+
+@app.post("/mcp/sse")
+async def proxy_mcp_sse(
+    request: Request,
+    current_user: Annotated[UserResponse, Depends(get_current_active_user)],
+    mcp_proxy: Annotated[MCPProxyService, Depends(get_mcp_proxy_service)],
+):
+    """MCP SSE 요청 프록시
+    
+    FastMCP의 Streamable HTTP 모드를 지원하는 SSE 프록시 엔드포인트.
+    클라이언트의 SSE 요청을 MCP 서버로 전달하고 응답 스트림을 프록시합니다.
+    """
+    # 요청 바디 읽기
+    request_data = await request.json()
+    
+    logger.info(
+        "MCP SSE 요청 수신",
+        user_id=current_user.id,
+        method=request_data.get("method"),
+    )
+    
+    # 원본 헤더 추출 (민감한 정보는 프록시 서비스에서 필터링)
+    headers = dict(request.headers)
+    
+    # SSE 스트림 생성기
+    async def event_generator():
+        async for event in mcp_proxy.forward_sse_request(
+            request_data=request_data,
+            user_roles=current_user.roles,
+            headers=headers,
+        ):
+            yield event
+    
+    # EventSourceResponse로 SSE 스트림 반환
+    return EventSourceResponse(event_generator())
 
 
 # === 사용자 검색 엔드포인트 ===

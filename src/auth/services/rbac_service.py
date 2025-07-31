@@ -1,10 +1,12 @@
 """역할 기반 접근 제어(RBAC) 서비스"""
 
 from typing import Optional
+import re
+import fnmatch
 
 import structlog
 
-from ..models import Permission, ResourceType, ActionType
+from ..models import Permission, ResourceType, ActionType, ResourcePermission
 
 
 logger = structlog.get_logger()
@@ -34,6 +36,7 @@ class RBACService:
         # 검색 도구들은 실제로는 READ 권한만 필요하지만,
         # 테스트의 의도에 따라 일부는 WRITE 권한을 요구하도록 설정
         self.tool_permissions = {
+            "health_check": None,  # 권한 체크 불필요 (모든 사용자 접근 가능)
             "search_web": (ResourceType.WEB_SEARCH, ActionType.READ),
             "search_vectors": (ResourceType.VECTOR_DB, ActionType.WRITE),  # 벡터 검색은 WRITE 권한 필요
             "search_database": (ResourceType.DATABASE, ActionType.WRITE),  # DB 검색은 WRITE 권한 필요
@@ -44,7 +47,7 @@ class RBACService:
         # guest는 search_web 도구를 사용할 수 없도록 제한
         self.tool_minimum_roles = {
             "search_web": ["user", "admin"],  # guest 제외
-            "search_vectors": ["admin"],
+            "search_vectors": ["user", "admin"],  # user도 사용 가능
             "search_database": ["admin"],
             "search_all": ["admin"],
         }
@@ -63,6 +66,7 @@ class RBACService:
             "user": [
                 Permission(resource=ResourceType.WEB_SEARCH, action=ActionType.READ),
                 Permission(resource=ResourceType.VECTOR_DB, action=ActionType.READ),
+                Permission(resource=ResourceType.VECTOR_DB, action=ActionType.WRITE),  # search_vectors 사용을 위해 추가
             ],
             "guest": [
                 Permission(resource=ResourceType.WEB_SEARCH, action=ActionType.READ),
@@ -195,6 +199,10 @@ class RBACService:
         
         required_permission = self.tool_permissions[tool_name]
         
+        # health_check는 모든 사용자 접근 가능
+        if tool_name == "health_check":
+            return True
+        
         # search_all은 모든 리소스에 대한 읽기 권한 필요
         if required_permission is None:
             required_resources = [
@@ -260,3 +268,129 @@ class RBACService:
                     resource=permission.resource,
                     action=permission.action,
                 )
+    
+    def check_resource_permission(
+        self,
+        roles: list[str],
+        resource_type: ResourceType,
+        resource_name: str,
+        action: ActionType,
+        resource_permissions: Optional[list[ResourcePermission]] = None
+    ) -> bool:
+        """세밀한 리소스 권한 확인
+        
+        특정 collection이나 table에 대한 권한을 확인합니다.
+        와일드카드 패턴을 지원합니다 (예: "public.*", "users.*")
+        
+        Args:
+            roles: 사용자 역할 목록
+            resource_type: 리소스 타입 (VECTOR_DB, DATABASE)
+            resource_name: 리소스 이름 (예: "users.documents", "public.users")
+            action: 수행하려는 작업
+            resource_permissions: 사용자의 세밀한 권한 목록 (DB에서 로드)
+            
+        Returns:
+            권한 여부
+        """
+        # 1. 먼저 기본 권한 체크 (전체 리소스 타입에 대한 권한)
+        if self.check_permission(roles, resource_type, action):
+            logger.debug(
+                "전체 리소스 타입 권한으로 허용",
+                roles=roles,
+                resource_type=resource_type,
+                action=action
+            )
+            return True
+        
+        # 2. admin은 모든 권한 가짐
+        if "admin" in roles:
+            return True
+        
+        # 3. 세밀한 권한이 없으면 거부
+        if not resource_permissions:
+            logger.debug(
+                "세밀한 권한 없음",
+                roles=roles,
+                resource_name=resource_name
+            )
+            return False
+        
+        # 4. 세밀한 권한 체크
+        for perm in resource_permissions:
+            if perm.resource_type != resource_type:
+                continue
+                
+            # 와일드카드 패턴 매칭
+            if self._match_resource_pattern(perm.resource_name, resource_name):
+                if action in perm.actions:
+                    logger.info(
+                        "세밀한 권한으로 허용",
+                        roles=roles,
+                        resource_name=resource_name,
+                        pattern=perm.resource_name,
+                        action=action
+                    )
+                    return True
+        
+        logger.warning(
+            "세밀한 권한 거부",
+            roles=roles,
+            resource_name=resource_name,
+            action=action
+        )
+        return False
+    
+    def _match_resource_pattern(self, pattern: str, resource_name: str) -> bool:
+        """리소스 패턴 매칭
+        
+        와일드카드 패턴을 지원합니다:
+        - "*" : 모든 문자 매칭
+        - "?" : 단일 문자 매칭
+        
+        Args:
+            pattern: 권한 패턴 (예: "public.*", "users.doc*")
+            resource_name: 실제 리소스 이름
+            
+        Returns:
+            매칭 여부
+        """
+        # fnmatch를 사용하여 Unix 스타일 와일드카드 패턴 매칭
+        return fnmatch.fnmatch(resource_name.lower(), pattern.lower())
+    
+    def get_allowed_resources(
+        self,
+        roles: list[str],
+        resource_type: ResourceType,
+        action: ActionType,
+        resource_permissions: Optional[list[ResourcePermission]] = None
+    ) -> list[str]:
+        """사용자가 접근 가능한 리소스 목록 반환
+        
+        Args:
+            roles: 사용자 역할 목록
+            resource_type: 리소스 타입
+            action: 작업 타입
+            resource_permissions: 사용자의 세밀한 권한 목록
+            
+        Returns:
+            접근 가능한 리소스 패턴 목록
+        """
+        allowed_patterns = []
+        
+        # 1. 전체 권한 체크
+        if self.check_permission(roles, resource_type, action):
+            allowed_patterns.append("*")  # 모든 리소스 접근 가능
+            return allowed_patterns
+        
+        # 2. admin은 모든 권한
+        if "admin" in roles:
+            allowed_patterns.append("*")
+            return allowed_patterns
+        
+        # 3. 세밀한 권한에서 패턴 수집
+        if resource_permissions:
+            for perm in resource_permissions:
+                if perm.resource_type == resource_type and action in perm.actions:
+                    allowed_patterns.append(perm.resource_name)
+        
+        return allowed_patterns

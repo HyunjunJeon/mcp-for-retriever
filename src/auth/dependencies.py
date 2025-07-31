@@ -38,13 +38,16 @@ MCP 서버의 인증, 권한 관리, 서비스 인스턴스 생성을 담당합�
 작성일: 2024-01-30
 """
 
-from typing import Annotated, TYPE_CHECKING
+from typing import Annotated, TYPE_CHECKING, Optional
 
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 from .models import UserResponse
 from .services import AuthService, AuthenticationError
+
+# 싱글톤 인스턴스 저장용
+_mcp_proxy_service_instance: Optional["MCPProxyService"] = None
 
 if TYPE_CHECKING:
     from .services import RBACService, MCPProxyService
@@ -282,6 +285,22 @@ def get_rbac_service() -> "RBACService":
     return RBACService()
 
 
+def get_permission_service() -> "PermissionService":
+    """
+    리소스 권한 관리 서비스 의존성
+    
+    세밀한 리소스 권한을 관리하는 서비스 인스턴스를 제공합니다.
+    현재는 기본 역할 기반 권한만 제공하지만, DB 연결 시 사용자별 권한도 지원합니다.
+    
+    Returns:
+        PermissionService: 권한 관리 서비스 인스턴스
+    """
+    from .services import PermissionService
+    
+    # TODO: 실제 구현에서는 DB 연결을 전달해야 함
+    return PermissionService(db_conn=None)
+
+
 def get_mcp_proxy_service() -> "MCPProxyService":
     """
     MCP 프록시 서비스 의존성
@@ -292,6 +311,7 @@ def get_mcp_proxy_service() -> "MCPProxyService":
     프록시 기능:
         - JWT 토큰을 Internal API Key로 변환
         - 사용자별 도구 접근 권한 검증
+        - 세밀한 리소스 레벨 권한 검증
         - MCP 서버로 요청 전달 및 응답 반환
         - 요청/응답 로깅 및 감사
         
@@ -300,14 +320,15 @@ def get_mcp_proxy_service() -> "MCPProxyService":
         - MCP_INTERNAL_API_KEY: MCP 서버 내부 인증키 (필수)
         
     의존성:
-        - RBACService: 권한 검증을 위한 RBAC 서비스
+        - RBACService: 역할 기반 권한 검증
+        - PermissionService: 세밀한 리소스 권한 검증
         
     Returns:
         MCPProxyService: MCP 프록시 서비스 인스턴스
         
     보안 특징:
         - 사용자 토큰을 내부 API 키로 안전하게 교환
-        - 요청별 권한 검증
+        - 역할 및 리소스별 권한 검증
         - 민감한 정보 필터링
         - 요청 추적 및 로깅
     """
@@ -318,15 +339,23 @@ def get_mcp_proxy_service() -> "MCPProxyService":
     mcp_server_url = os.getenv("MCP_SERVER_URL", "http://localhost:8001")
     internal_api_key = os.getenv("MCP_INTERNAL_API_KEY", "")
     
-    # RBAC 서비스 인스턴스 생성
+    # 서비스 인스턴스 생성
     rbac_service = get_rbac_service()
+    permission_service = get_permission_service()
     
-    # MCP 프록시 서비스 생성
-    return MCPProxyService(
-        mcp_server_url=mcp_server_url,
-        rbac_service=rbac_service,
-        internal_api_key=internal_api_key,
-    )
+    # 싱글톤 인스턴스 확인
+    global _mcp_proxy_service_instance
+    
+    if _mcp_proxy_service_instance is None:
+        # MCP 프록시 서비스 생성 (싱글톤)
+        _mcp_proxy_service_instance = MCPProxyService(
+            mcp_server_url=mcp_server_url,
+            rbac_service=rbac_service,
+            internal_api_key=internal_api_key,
+            permission_service=permission_service,
+        )
+    
+    return _mcp_proxy_service_instance
 
 
 class RoleChecker:

@@ -239,20 +239,33 @@ class InMemoryUserRepository(UserRepository):
             5. 생성 완료 로깅
         """
         # 기본 사용자 계정 정의
+        from datetime import datetime, UTC
+        
+        now = datetime.now(UTC)
         default_users = [
             {
-                "id": "admin-123",
+                "id": 1,
                 "email": "admin@example.com",
+                "username": "admin",
                 # bcrypt 해시된 비밀번호: "Admin123!"
                 "hashed_password": "$2b$12$EGdnlElxO9sCf0gMMiHPgeU9snt1agptpaf6IORYNZm.SyHZ3jekO",
                 "roles": ["admin"],
+                "is_active": True,
+                "is_verified": True,
+                "created_at": now,
+                "updated_at": now,
             },
             {
-                "id": "user-123", 
+                "id": 2, 
                 "email": "user@example.com",
+                "username": "user",
                 # bcrypt 해시된 비밀번호: "User123!"
                 "hashed_password": "$2b$12$a6LuLorpYqUfcZnSt6CaNO9trnFXxpwUAVRDCzw27diacidYjmuGC",
                 "roles": ["user"],
+                "is_active": True,
+                "is_verified": True,
+                "created_at": now,
+                "updated_at": now,
             },
         ]
         
@@ -307,13 +320,24 @@ class InMemoryUserRepository(UserRepository):
             - UUID 기반 ID로 충돌 방지
             - 인덱스 일관성 유지
         """
-        # UUID 기반 고유 ID 자동 생성 (제공되지 않은 경우)
+        # 정수형 ID 자동 생성 (제공되지 않은 경우)
         if "id" not in user_data:
-            user_data["id"] = str(uuid.uuid4())
+            # 현재 사용 중인 최대 ID를 찾아서 +1
+            max_id = max((user.id for user in self._users.values() if isinstance(user.id, int)), default=0)
+            user_data["id"] = max_id + 1
         
         # 이메일 중복 검사 (비즈니스 규칙)
         if user_data["email"] in self._email_index:
             raise ValueError(f"이미 존재하는 이메일: {user_data['email']}")
+        
+        # 필수 필드 기본값 설정
+        now = datetime.now(UTC)
+        user_data.setdefault("is_active", True)
+        user_data.setdefault("is_verified", False)
+        user_data.setdefault("roles", ["user"])
+        user_data.setdefault("created_at", now)
+        user_data.setdefault("updated_at", now)
+        user_data.setdefault("username", user_data["email"].split("@")[0])
         
         # Pydantic User 모델 인스턴스 생성 (자동 유효성 검증)
         user = User(**user_data)  # type: ignore[misc]
@@ -342,8 +366,8 @@ class InMemoryUserRepository(UserRepository):
         사용자 인증, 권한 검사, 프로필 조회 등 다양한 상황에서 사용됩니다.
         
         Args:
-            user_id (str): 조회할 사용자의 고유 식별자 (UUID 형식)
-                예: "550e8400-e29b-41d4-a716-446655440000"
+            user_id (str): 조회할 사용자의 고유 식별자 (문자열 형태의 정수)
+                예: "1", "2", "3"
                 
         Returns:
             Optional[User]: 사용자 객체 또는 None
@@ -361,14 +385,20 @@ class InMemoryUserRepository(UserRepository):
             - 권한 검증을 위한 사용자 정보 확인
             - 사용자 프로필 페이지 렌더링
         """
-        user = self._users.get(user_id)
-        
-        if user:
-            logger.debug("사용자 조회 성공", user_id=user_id)
-        else:
-            logger.debug("사용자 조회 실패", user_id=user_id)
+        try:
+            # JWT 토큰에서 오는 user_id는 문자열이므로 정수로 변환
+            numeric_user_id = int(user_id)
+            user = self._users.get(numeric_user_id)
             
-        return user
+            if user:
+                logger.debug("사용자 조회 성공", user_id=user_id, numeric_id=numeric_user_id)
+            else:
+                logger.debug("사용자 조회 실패", user_id=user_id, numeric_id=numeric_user_id)
+                
+            return user
+        except (ValueError, TypeError) as e:
+            logger.warning("잘못된 사용자 ID 형식", user_id=user_id, error=str(e))
+            return None
     
     async def get_by_email(self, email: str) -> Optional[User]:
         """
@@ -406,7 +436,8 @@ class InMemoryUserRepository(UserRepository):
         user_id = self._email_index.get(email)
         
         if user_id:
-            return await self.get_by_id(user_id)
+            # user_id는 정수형이므로 문자열로 변환하여 get_by_id에 전달
+            return await self.get_by_id(str(user_id))
         
         logger.debug("이메일로 사용자 조회 실패", email=email)
         return None
@@ -462,10 +493,16 @@ class InMemoryUserRepository(UserRepository):
             - 역할 변경 시 권한 재검증 필요
             - 부분 업데이트로 기존 데이터는 유지됨
         """
-        user = self._users.get(user_id)
-        
-        if not user:
-            logger.warning("업데이트할 사용자 없음", user_id=user_id)
+        try:
+            # 문자열 user_id를 정수로 변환
+            numeric_user_id = int(user_id)
+            user = self._users.get(numeric_user_id)
+            
+            if not user:
+                logger.warning("업데이트할 사용자 없음", user_id=user_id, numeric_id=numeric_user_id)
+                return None
+        except (ValueError, TypeError) as e:
+            logger.warning("잘못된 사용자 ID 형식 (update)", user_id=user_id, error=str(e))
             return None
         
         # 이메일 변경 시 인덱스 업데이트
@@ -476,8 +513,8 @@ class InMemoryUserRepository(UserRepository):
             
             # 기존 이메일 인덱스 제거
             del self._email_index[user.email]
-            # 새 이메일 인덱스 추가
-            self._email_index[user_data["email"]] = user_id
+            # 새 이메일 인덱스 추가 (numeric_user_id 사용)
+            self._email_index[user_data["email"]] = numeric_user_id
         
         # 업데이트
         updated_data = user.model_dump()
@@ -485,11 +522,12 @@ class InMemoryUserRepository(UserRepository):
         updated_data["updated_at"] = datetime.now(UTC)
         
         updated_user = User(**updated_data)  # type: ignore[misc]
-        self._users[user_id] = updated_user
+        self._users[numeric_user_id] = updated_user
         
         logger.info(
             "사용자 업데이트",
             user_id=user_id,
+            numeric_id=numeric_user_id,
             updated_fields=list(user_data.keys()),
         )
         
@@ -538,20 +576,26 @@ class InMemoryUserRepository(UserRepository):
             - 관련 권한 및 세션 정리 필요
             - 삭제 전 데이터 백업 권장
         """
-        user = self._users.get(user_id)
-        
-        if not user:
-            logger.warning("삭제할 사용자 없음", user_id=user_id)
+        try:
+            # 문자열 user_id를 정수로 변환
+            numeric_user_id = int(user_id)
+            user = self._users.get(numeric_user_id)
+            
+            if not user:
+                logger.warning("삭제할 사용자 없음", user_id=user_id, numeric_id=numeric_user_id)
+                return False
+            
+            # 인덱스에서 제거
+            del self._email_index[user.email]
+            # 사용자 제거
+            del self._users[numeric_user_id]
+            
+            logger.info("사용자 삭제", user_id=user_id, numeric_id=numeric_user_id, email=user.email)
+            
+            return True
+        except (ValueError, TypeError) as e:
+            logger.warning("잘못된 사용자 ID 형식 (delete)", user_id=user_id, error=str(e))
             return False
-        
-        # 인덱스에서 제거
-        del self._email_index[user.email]
-        # 사용자 제거
-        del self._users[user_id]
-        
-        logger.info("사용자 삭제", user_id=user_id, email=user.email)
-        
-        return True
     
     async def search_users(self, query: str, limit: int = 10) -> list[User]:
         """사용자 검색 (이메일 또는 이름으로)

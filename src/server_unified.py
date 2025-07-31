@@ -376,11 +376,11 @@ class UnifiedMCPServer:
         
         # 미들웨어 적용
         for middleware in self.middlewares:
-            server.add_middleware(lambda req, next, mw=middleware: mw(req, next))
+            server.add_middleware(middleware)
         
         # 컨텍스트 미들웨어 (별도 처리)
-        if self.config.features["context"]:
-            server.add_middleware(self._create_context_middleware())
+        # if self.config.features["context"]:
+        #     server.add_middleware(self._create_context_middleware())
         
         # 도구 등록
         self._register_tools(server)
@@ -422,7 +422,7 @@ class UnifiedMCPServer:
     
     def _create_context_middleware(self):
         """컨텍스트 미들웨어 생성"""
-        async def context_middleware(request: dict[str, Any], call_next):
+        async def context_middleware(context, call_next):
             start_time = time()
             request_id = str(uuid.uuid4())
             
@@ -434,6 +434,9 @@ class UnifiedMCPServer:
             # 컨텍스트 저장
             if self.context_store is not None:
                 self.context_store[request_id] = user_context
+            
+            # context에서 request 가져오기
+            request = context.request if hasattr(context, 'request') else {}
             
             # 인증 정보 처리
             if self.config.features["auth"]:
@@ -452,27 +455,34 @@ class UnifiedMCPServer:
                                 if response.status_code == 200:
                                     user_info = response.json()
                                     user_context.set_user(user_info)
-                                    request["user"] = user_info
-                                    request["user_context"] = user_context
+                                    if isinstance(request, dict):
+                                        request["user"] = user_info
+                                        request["user_context"] = user_context
                         except Exception as e:
                             logger.error("사용자 정보 획득 실패", error=str(e))
                     else:
                         # 서비스 간 호출
                         user_info = {"type": "service", "service": "internal"}
                         user_context.set_user(user_info)
-                        request["user"] = user_info
-                        request["user_context"] = user_context
+                        if isinstance(request, dict):
+                            request["user"] = user_info
+                            request["user_context"] = user_context
             
             # 요청 로깅
+            method = request.get("method") if isinstance(request, dict) else None
+            tool_name = None
+            if isinstance(request, dict) and "params" in request:
+                tool_name = request.get("params", {}).get("name")
+            
             logger.info(
                 "MCP 요청",
                 request_id=request_id,
-                method=request.get("method"),
-                tool_name=request.get("params", {}).get("name") if "params" in request else None
+                method=method,
+                tool_name=tool_name
             )
             
             try:
-                response = await call_next(request)
+                response = await call_next(context)
                 
                 # 응답 시간 로깅
                 duration_ms = (time() - start_time) * 1000
@@ -889,6 +899,8 @@ class UnifiedMCPServer:
                 emoji = "✅" if use_emoji else ""
                 await ctx.info(f"{emoji} 메트릭 조회 성공")
                 return metrics
+        
+        # MCP 프로토콜 알림 처리기는 FastMCP에서 자동 처리됨
     
     async def _search_single_source(
         self,
