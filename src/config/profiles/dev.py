@@ -42,7 +42,7 @@ DEV_CONFIG = ServerConfig(
         jwt_algorithm="HS256",
         jwt_access_token_expire_minutes=60,  # 개발 중 긴 만료 시간
         jwt_refresh_token_expire_days=7,
-        require_auth=False,  # 개발 중 인증 선택적
+        require_auth=True,  # 인증 필수 - 잘못된 토큰은 항상 거부
     ),
     
     # 개발용 캐시 설정 (짧은 TTL)

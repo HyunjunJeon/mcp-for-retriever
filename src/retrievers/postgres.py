@@ -22,6 +22,8 @@ from typing import AsyncIterator, Any, Optional
 from contextlib import asynccontextmanager
 import asyncpg
 from asyncpg import Pool
+from asyncpg.prepared_stmt import PreparedStatement
+from asyncpg import Record
 
 from src.retrievers.base import (
     Retriever,
@@ -270,6 +272,198 @@ class PostgresRetriever(Retriever):
                 
         except asyncpg.PostgresError as e:
             raise QueryError(f"Execute failed: {e}", "PostgresRetriever")
+    
+    async def execute_returning(self, query: str, *args: Any) -> Optional[dict[str, Any]]:
+        """
+        RETURNING 절이 있는 쓰기 작업 실행 (INSERT, UPDATE, DELETE)
+        
+        데이터를 변경하고 결과를 반환하는 SQL 문을 실행합니다.
+        
+        Args:
+            query (str): RETURNING 절이 포함된 SQL 쿼리
+            *args: 쿼리 매개변수
+            
+        Returns:
+            반환된 레코드 (dict) 또는 None
+            
+        Raises:
+            ConnectionError: 연결되지 않은 경우
+            QueryError: 실행 실패 시
+        """
+        if not self._connected:
+            raise ConnectionError("Not connected to PostgreSQL", "PostgresRetriever")
+        
+        try:
+            async with self._pool.acquire() as conn:
+                result = await conn.fetchrow(query, *args)
+                return dict(result) if result else None
+                
+        except asyncpg.PostgresError as e:
+            raise QueryError(f"Execute failed: {e}", "PostgresRetriever")
+    
+    async def execute_returning_scalar(self, query: str, *args: Any) -> Any:
+        """
+        스칼라 값을 반환하는 쓰기 작업 실행
+        
+        단일 값을 반환하는 SQL 문을 실행합니다.
+        
+        Args:
+            query (str): RETURNING 절이 포함된 SQL 쿼리
+            *args: 쿼리 매개변수
+            
+        Returns:
+            반환된 스칼라 값
+            
+        Raises:
+            ConnectionError: 연결되지 않은 경우
+            QueryError: 실행 실패 시
+        """
+        if not self._connected:
+            raise ConnectionError("Not connected to PostgreSQL", "PostgresRetriever")
+        
+        try:
+            async with self._pool.acquire() as conn:
+                return await conn.fetchval(query, *args)
+                
+        except asyncpg.PostgresError as e:
+            raise QueryError(f"Execute failed: {e}", "PostgresRetriever")
+    
+    async def compose_insert_query(
+        self,
+        table: str,
+        data: dict[str, Any],
+        returning: Optional[str] = "*"
+    ) -> tuple[str, list[Any]]:
+        """
+        안전한 INSERT 쿼리 생성
+        
+        SQL 인젝션을 방지하기 위해 테이블명과 컬럼명을 안전하게 이스케이핑합니다.
+        
+        Args:
+            table: 테이블 이름
+            data: 삽입할 데이터 (컬럼명: 값)
+            returning: RETURNING 절 (기본값: "*")
+            
+        Returns:
+            (쿼리 문자열, 값 리스트) 튜플
+        """
+        if not self._connected or not self._pool:
+            raise ConnectionError("Not connected to PostgreSQL", "PostgresRetriever")
+        
+        columns = list(data.keys())
+        values = list(data.values())
+        
+        # asyncpg는 identifier escaping을 자동으로 처리
+        # 파라미터 플레이스홀더 생성
+        placeholders = [f"${i+1}" for i in range(len(values))]
+        
+        # 안전한 identifier escaping을 위해 connection의 quote_ident 사용
+        async with self._pool.acquire() as conn:
+            # 테이블명과 컬럼명을 안전하게 이스케이핑
+            quoted_table = conn._protocol.get_settings().quote_ident(table)
+            quoted_columns = [conn._protocol.get_settings().quote_ident(col) for col in columns]
+            
+            query = f"""
+                INSERT INTO {quoted_table} ({', '.join(quoted_columns)})
+                VALUES ({', '.join(placeholders)})
+            """
+            
+            if returning:
+                query += f" RETURNING {returning}"
+            
+            return query, values
+    
+    async def compose_update_query(
+        self,
+        table: str,
+        data: dict[str, Any],
+        where_clause: str,
+        where_values: list[Any],
+        returning: Optional[str] = "*"
+    ) -> tuple[str, list[Any]]:
+        """
+        안전한 UPDATE 쿼리 생성
+        
+        Args:
+            table: 테이블 이름
+            data: 업데이트할 데이터
+            where_clause: WHERE 절 (예: "id = $1")
+            where_values: WHERE 절의 파라미터 값
+            returning: RETURNING 절
+            
+        Returns:
+            (쿼리 문자열, 전체 값 리스트) 튜플
+        """
+        if not self._connected or not self._pool:
+            raise ConnectionError("Not connected to PostgreSQL", "PostgresRetriever")
+        
+        set_clauses = []
+        values = []
+        
+        async with self._pool.acquire() as conn:
+            quoted_table = conn._protocol.get_settings().quote_ident(table)
+            
+            # SET 절 구성
+            for i, (col, val) in enumerate(data.items()):
+                quoted_col = conn._protocol.get_settings().quote_ident(col)
+                set_clauses.append(f"{quoted_col} = ${i+1}")
+                values.append(val)
+            
+            # WHERE 절의 플레이스홀더 번호 조정
+            offset = len(values)
+            adjusted_where = where_clause
+            for i in range(len(where_values)):
+                # $1, $2 등을 새로운 번호로 교체
+                adjusted_where = adjusted_where.replace(f"${i+1}", f"${i+1+offset}")
+            
+            # WHERE 절 값 추가
+            values.extend(where_values)
+            
+            query = f"""
+                UPDATE {quoted_table}
+                SET {', '.join(set_clauses)}
+                WHERE {adjusted_where}
+            """
+            
+            if returning:
+                query += f" RETURNING {returning}"
+            
+            return query, values
+    
+    async def compose_delete_query(
+        self,
+        table: str,
+        where_clause: str,
+        where_values: list[Any],
+        returning: Optional[str] = "id"
+    ) -> tuple[str, list[Any]]:
+        """
+        안전한 DELETE 쿼리 생성
+        
+        Args:
+            table: 테이블 이름
+            where_clause: WHERE 절
+            where_values: WHERE 절의 파라미터 값
+            returning: RETURNING 절
+            
+        Returns:
+            (쿼리 문자열, 값 리스트) 튜플
+        """
+        if not self._connected or not self._pool:
+            raise ConnectionError("Not connected to PostgreSQL", "PostgresRetriever")
+        
+        async with self._pool.acquire() as conn:
+            quoted_table = conn._protocol.get_settings().quote_ident(table)
+            
+            query = f"""
+                DELETE FROM {quoted_table}
+                WHERE {where_clause}
+            """
+            
+            if returning:
+                query += f" RETURNING {returning}"
+            
+            return query, where_values
     
     @asynccontextmanager
     async def transaction(self):

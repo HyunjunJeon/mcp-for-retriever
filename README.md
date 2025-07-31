@@ -4,67 +4,33 @@
 
 ## 주요 기능
 
+### 🔍 검색 기능
+
 - **웹 검색**: Tavily를 통한 웹 콘텐츠 검색 통합
 - **벡터 검색**: 의미론적 검색 기능을 갖춘 Qdrant 벡터 데이터베이스
 - **데이터베이스 검색**: SQL 및 텍스트 검색을 지원하는 PostgreSQL 통합
 - **동시 검색**: 모든 소스에서 동시에 검색 실행
-- **타입 안전성**: Python 3.12+ 기능을 활용한 완전한 타입 체킹
-- **비동기 우선**: 고성능을 위한 asyncio 기반 구현
+
+### 🛡️ 보안 및 인증
+
 - **JWT 인증**: 역할 기반 권한 제어를 통한 보안 액세스 제어
-- **FastMCP 통합**: FastMCP의 내장 인증 및 미들웨어 활용
+- **FastMCP Bearer Token**: FastMCP의 내장 인증 및 미들웨어 활용
 - **서버 간 인증**: 안전한 내부 API 키 인증
-- **Redis 캐싱**: 구성 가능한 TTL을 통한 성능 최적화
-- **Docker 지원**: Docker Compose를 통한 완전한 컨테이너화
 - **사용자 관리**: 등록, 로그인, 검색, 관리자 기능
-- **관찰성**: OpenTelemetry 추적 및 Sentry 에러 추적
-- **메트릭 내보내기**: Prometheus 호환 메트릭 엔드포인트
-- **분산 추적**: W3C Trace Context 전파
-- **성능 모니터링**: 요청 지연 시간 및 처리량 추적
 
-## 🚀 최근 업데이트
+### 🚀 성능 및 확장성
 
-### Phase 1 - 핵심 인증 ✅
-- **FastMCP Bearer Token 통합**: MCP 서버가 이제 FastMCP의 내장 인증 사용
-- **서버 간 보안**: 서비스 통신을 위한 내부 API 키 인증
-- **개선된 Auth Gateway**: 안전한 토큰 전달을 통한 향상된 프록시 서비스
-- **HTTP 전송 모드**: HTTP 기반 MCP 통신을 위한 전체 지원
+- **비동기 우선**: 고성능을 위한 asyncio 기반 구현
+- **Redis 캐싱**: 구성 가능한 TTL을 통한 성능 최적화
+- **타입 안전성**: Python 3.12+ 기능을 활용한 완전한 타입 체킹
+- **Docker 지원**: Docker Compose를 통한 완전한 컨테이너화
 
-### Phase 2 - 고급 기능 ✅
-- **미들웨어 스택**: 포괄적인 요청 처리 파이프라인
-  - 사용자 정의 예외 계층 구조를 통한 에러 처리
-  - JWT 검증을 통한 인증
-  - 민감한 데이터 보호를 통한 요청/응답 로깅
-  - 요청 검증 및 RBAC 권한 확인
-  - Rate limiting (분당 60개, 시간당 1000개 요청, 버스트 제어 포함)
-  - 성능 메트릭 및 사용 통계
-- **향상된 컨텍스트**: 요청 수명 주기 전반에 걸친 사용자 정보 전파
-- **모니터링**: 도구 사용 추적, 오류 통계 및 성능 메트릭
-- **개선된 에러 처리**: 적절한 JSON-RPC 코드를 사용한 상세한 오류 응답
-- **요청 추적**: 디버깅 및 로그 상관관계를 위한 고유 요청 ID
-- **모든 미들웨어 컴포넌트에 대한 단위 테스트**
-- **OpenTelemetry 통합**:
-  - W3C Trace Context를 사용한 분산 추적
-  - FastAPI, HTTPX, AsyncPG, Redis를 위한 자동 계측
-  - MCP 작업을 위한 사용자 정의 메트릭
-  - Prometheus 메트릭 내보내기 엔드포인트
-  - Jaeger/Tempo를 위한 OTLP 내보내기 지원
-- **Sentry 통합**:
-  - 오류 추적 및 성능 모니터링
-  - 사용자 컨텍스트 전파
-  - 민감한 데이터 삭제
-  - 트랜잭션 수준 성능 추적
-- **관찰성 미들웨어**:
-  - 통합 추적 및 오류 캡처
-  - 컨텍스트를 위한 Baggage 전파
-  - 요청 수준 추적 상관관계
+### 📊 모니터링 및 관찰성
 
-### 🚧 Phase 3 - 프로덕션 준비 (예정)
-- [ ] API 버전 관리 지원
-- [ ] 모니터링을 위한 관리자 대시보드
-- [ ] 자동 백업 및 복구
-- [ ] 다중 지역 배포 지원
-- [ ] 분산 캐시를 통한 수평적 확장
-- [ ] 외부 서비스를 위한 서킷 브레이커 패턴
+- **OpenTelemetry**: 분산 추적 및 메트릭 수집
+- **Sentry 통합**: 에러 추적 및 성능 모니터링
+- **Prometheus 메트릭**: 시스템 모니터링을 위한 메트릭 엔드포인트
+- **요청 추적**: 디버깅을 위한 고유 요청 ID 및 로그 상관관계
 
 ## 🆕 통합 서버 (New!)
 
@@ -256,8 +222,8 @@ Claude Desktop에서 MCP 서버에 연결하려면 `mcp.json` 파일을 다음�
 {
   "mcpServers": {
     "mcp-retriever": {
-      "url": "http://localhost:8000/mcp/proxy",
-      "transport": "sse",
+      "url": "http://localhost:8001/",
+      "transport": "http",
       "auth": {
         "type": "bearer",
         "token": "YOUR_JWT_TOKEN_HERE"
@@ -268,9 +234,12 @@ Claude Desktop에서 MCP 서버에 연결하려면 `mcp.json` 파일을 다음�
 }
 ```
 
-### Auth Gateway 접속 방법
+> **참고**: 이제 클라이언트는 Auth Gateway(8000)를 거치지 않고 MCP Server(8001)에 직접 연결합니다.
+
+### 인증 플로우
 
 #### 1. 사용자 등록
+
 ```bash
 curl -X POST http://localhost:8000/auth/register \
   -H "Content-Type: application/json" \
@@ -278,6 +247,7 @@ curl -X POST http://localhost:8000/auth/register \
 ```
 
 **응답 예시**:
+
 ```json
 {
   "id": "550e8400-e29b-41d4-a716-446655440000",
@@ -287,6 +257,7 @@ curl -X POST http://localhost:8000/auth/register \
 ```
 
 #### 2. 로그인 및 토큰 획듍
+
 ```bash
 curl -X POST http://localhost:8000/auth/login \
   -H "Content-Type: application/json" \
@@ -294,6 +265,7 @@ curl -X POST http://localhost:8000/auth/login \
 ```
 
 **응답 예시**:
+
 ```json
 {
   "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
@@ -303,6 +275,7 @@ curl -X POST http://localhost:8000/auth/login \
 ```
 
 #### 3. 토큰으로 인증된 요청 보내기
+
 ```bash
 # 사용자 정보 조회
 curl -X GET http://localhost:8000/auth/me \
@@ -320,7 +293,9 @@ curl -X POST http://localhost:8000/mcp/proxy \
 ```
 
 #### 4. 토큰 갱신
+
 액세스 토큰이 만료되면 (30분) 리프레시 토큰으로 갱신:
+
 ```bash
 curl -X POST http://localhost:8000/auth/refresh \
   -H "Content-Type: application/json" \
@@ -328,7 +303,9 @@ curl -X POST http://localhost:8000/auth/refresh \
 ```
 
 #### 5. mcp.json 업데이트
+
 획듍한 액세스 토큰을 `mcp.json`의 `token` 필드에 입력:
+
 ```json
 {
   "mcpServers": {
@@ -453,12 +430,12 @@ graph TB
         Client[MCP Client<br/>Claude/LLM]
     end
 
-    subgraph "Gateway Layer"
-        AuthGateway[Auth Gateway<br/>:8000<br/>JWT Auth & RBAC]
+    subgraph "Auth Service"
+        AuthGateway[Auth Gateway<br/>:8000<br/>JWT Issuer & User Management]
     end
 
-    subgraph "Service Layer"
-        MCPServer[MCP Server<br/>:8001<br/>FastMCP v2.10.6]
+    subgraph "MCP Service"
+        MCPServer[MCP Server<br/>:8001<br/>FastMCP v2.10.6<br/>with JWT Validation]
     end
 
     subgraph "Data Layer"
@@ -467,7 +444,7 @@ graph TB
         end
         
         subgraph "Databases"
-            PostgreSQL[(PostgreSQL<br/>:5432<br/>Users & Content)]
+            PostgreSQL[(PostgreSQL<br/>:5432<br/>Users & Permissions)]
             Qdrant[(Qdrant<br/>:6333/6334<br/>Vector Store)]
         end
     end
@@ -476,22 +453,25 @@ graph TB
         Tavily[Tavily API<br/>Web Search]
     end
 
-    %% Client connections
-    Client -->|HTTP/SSE| AuthGateway
+    %% Client flows (새로운 아키텍처)
+    Client -->|1. Login| AuthGateway
+    AuthGateway -->|2. JWT Token| Client
+    Client -->|3. Direct Request<br/>with JWT| MCPServer
     
-    %% Auth Gateway connections
-    AuthGateway -->|Proxy MCP| MCPServer
-    AuthGateway <-->|Auth Data| PostgreSQL
+    %% Auth Gateway connections (인증 서비스만)
+    AuthGateway <-->|User/Permission Data| PostgreSQL
     AuthGateway <-->|Session| Redis
     
     %% MCP Server connections
+    MCPServer -->|JWT Validation| MCPServer
     MCPServer <-->|Query| PostgreSQL
     MCPServer <-->|Vector Search| Qdrant
     MCPServer <-->|Cache| Redis
     MCPServer -->|Web Search| Tavily
     
     %% Network
-    AuthGateway -.->|Docker Network<br/>172.20.0.0/16| MCPServer
+    Client -.->|Docker Network<br/>172.20.0.0/16| AuthGateway
+    Client -.->|Docker Network<br/>172.20.0.0/16| MCPServer
     MCPServer -.->|Internal| Redis
     MCPServer -.->|Internal| PostgreSQL
     MCPServer -.->|Internal| Qdrant
@@ -500,24 +480,33 @@ graph TB
 ### 컴포넌트 상세
 
 #### 1. Auth Gateway (Port 8000)
-- **Technology**: FastAPI + Uvicorn
+
+- **Technology**: FastAPI + Uvicorn + FastHTML
+- **Primary Role**: 인증 서비스 및 사용자 관리
 - **Features**:
-  - JWT 기반 인증 (HS256)
-  - 역할 기반 접근 제어 (RBAC)
-  - MCP 요청 프록시
-  - 사용자 관리 API
-  - 상태 체크: `/health`
+  - JWT 토큰 발급 (로그인 시)
+  - 사용자 등록 및 관리
+  - 권한 관리 CRUD API
+  - 웹 기반 관리자 인터페이스
+  - 역할 기반 접근 제어 (RBAC) 설정
+  - API: `/auth/login`, `/auth/register`, `/auth/refresh`
+  - Admin UI: `/admin`, `/admin/users`, `/admin/permissions`
 
 #### 2. MCP Server (Port 8001)
+
 - **Technology**: FastMCP v2.10.6
 - **Transport**: Streamable HTTP
+- **Authentication**: JWT Bearer Token (직접 검증)
 - **Features**:
+  - JWT 미들웨어를 통한 토큰 검증
+  - 권한 기반 도구 접근 제어
   - 통합 검색 도구 제공
   - 컨텍스트 추적
   - 캐싱 지원
   - 구조화된 로깅
 
 #### 3. PostgreSQL (Port 5432)
+
 - **Version**: 17-alpine
 - **Database**: mcp_retriever
 - **Functions**:
@@ -526,6 +515,7 @@ graph TB
   - 전문 검색 지원
 
 #### 4. Qdrant (Port 6333/6334)
+
 - **Version**: latest
 - **Functions**:
   - 벡터 임베딩 저장
@@ -533,6 +523,7 @@ graph TB
   - gRPC 인터페이스 (6334)
 
 #### 5. Redis (Port 6379)
+
 - **Version**: latest
 - **Functions**:
   - 세션 관리
@@ -594,6 +585,7 @@ networks:
 ## 프로젝트 상태
 
 ### ✅ Phase 1 - 핵심 기능 및 인증 (완료)
+
 - 비동기 지원을 포함한 기본 리트리버 인터페이스
 - 모든 리트리버 구현:
   - 재시도 로직을 포함한 Tavily 웹 검색 리트리버
@@ -615,6 +607,7 @@ networks:
   - 인증 흐름 통합 테스트
 
 ### ✅ Phase 2 - 고급 기능 (완료)
+
 - 향상된 컨텍스트 기반 사용자 정보 전파
 - 고급 미들웨어 구현:
   - JWT 검증을 포함한 인증 미들웨어
@@ -645,6 +638,7 @@ networks:
   - 요청 수준 추적 상관관계
 
 ### 🚧 Phase 3 - 프로덕션 준비 (예정)
+
 - [ ] API 버전 관리 지원
 - [ ] 모니터링을 위한 관리자 대시보드
 - [ ] 자동 백업 및 복구
@@ -706,10 +700,11 @@ curl -X POST http://localhost:8001/ \
 export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
 
 # OpenTelemetry 활성화로 실행
-uv run python -m src.server_auth
+uv run python -m src.server_unified
 ```
 
 기능:
+
 - FastAPI, HTTPX, AsyncPG, Redis를 위한 자동 계측
 - MCP 작업을 위한 사용자 정의 메트릭
 - W3C Trace Context 전파
@@ -752,18 +747,20 @@ curl -X POST http://localhost:8001/ \
 
 ### 인증 아키텍처
 
-시스템은 이중 계층 인증 아키텍처를 구현합니다:
+시스템은 분리된 인증 아키텍처를 구현합니다:
 
 1. **Auth Gateway (포트 8000)**:
-   - JWT 기반 사용자 인증
-   - 역할 기반 액세스 제어 (RBAC)
-   - 사용자 관리 및 등록
-   - 권한 확인을 통한 MCP 요청 프록시
+   - JWT 토큰 발급 및 관리
+   - 사용자 등록 및 인증
+   - 역할 및 권한 관리 (RBAC)
+   - 웹 기반 관리자 인터페이스
+   - 권한 관리 CRUD API
 
 2. **MCP 서버 (포트 8001)**:
-   - FastMCP bearer token 인증
-   - 서버 간 통신을 위한 내부 API 키
-   - 요청 검증 및 사용자 컨텍스트 전파
+   - JWT Bearer Token 직접 검증
+   - 미들웨어를 통한 토큰 검증
+   - 도구별 권한 확인
+   - 사용자 컨텍스트 유지
 
 ### 보안 모범 사례
 
@@ -803,16 +800,19 @@ CACHE_TTL_SECONDS=300
 ## 📜 주요 스크립트
 
 ### 빠른 시작 및 실행
+
 - `./scripts/quick-start.sh` - 대화형 서버 실행 도구 (프로파일, 전송 모드 선택)
 - `./scripts/run-unified-server.sh` - 통합 서버 실행 (옵션: --profile, --transport, --port)
 - `./scripts/test-local.sh` - Docker 없이 로컬에서 전체 시스템 실행
 
 ### Docker 관련
+
 - `./scripts/start-docker.sh` - Docker Compose로 모든 서비스 시작
 - `./scripts/stop-docker.sh` - 서비스 중지 (--volumes로 데이터 초기화)
 - `./scripts/logs-docker.sh` - 서비스 로그 확인 (-f로 실시간 추적)
 
 ### 테스트 및 상태 확인
+
 - `./scripts/test-services.sh` - 모든 서비스 헬스체크
 - `./scripts/run-integration-tests.sh` - Docker 환경에서 통합 테스트 실행
 - `./scripts/test-auth-integration.sh` - 인증 플로우 테스트
@@ -890,6 +890,7 @@ docker-compose -f docker-compose.local.yml ps
 ## 🚀 배포 현황
 
 ### ✅ 성공적으로 배포된 서비스
+
 1. **PostgreSQL**: Healthy, 스키마 초기화 완료
 2. **Qdrant**: Running, 벡터 작업 준비 완료
 3. **Redis**: Healthy, 연결 수락 중
@@ -897,6 +898,7 @@ docker-compose -f docker-compose.local.yml ps
 5. **MCP Server**: Healthy, 모든 도구 사용 가능
 
 ### 🔧 사용된 구성
+
 - **Profile**: DEV (개발 모드)
 - **Transport**: HTTP (Streamable)
 - **Rate Limiting**: 개발용으로 비활성화
@@ -904,6 +906,7 @@ docker-compose -f docker-compose.local.yml ps
 - **Authentication**: 내부 API 키와 함께 JWT
 
 ### 📊 리소스 할당
+
 - **Network**: Bridge 네트워크 (172.20.0.0/16)
 - **Volumes**: 모든 데이터베이스의 영구 저장소
 - **Health Checks**: 모든 서비스에 구성됨
@@ -928,10 +931,10 @@ sequenceDiagram
     AG->>R: Store session
     AG-->>C: JWT token
 
-    %% MCP Tool Call Flow
-    C->>AG: POST /mcp/<br/>Authorization: Bearer {token}
-    AG->>AG: Validate JWT
-    AG->>MS: Proxy MCP request
+    %% Direct MCP Tool Call (새로운 플로우)
+    C->>MS: POST /<br/>Authorization: Bearer {token}
+    MS->>MS: Validate JWT locally
+    MS->>MS: Check permissions
     
     alt search_web
         MS->>T: Search query
@@ -952,8 +955,7 @@ sequenceDiagram
     end
     
     MS->>R: Cache results
-    MS-->>AG: Tool response
-    AG-->>C: MCP response
+    MS-->>C: Tool response
 ```
 
 ## 문서

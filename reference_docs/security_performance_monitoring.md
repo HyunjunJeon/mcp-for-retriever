@@ -1,7 +1,7 @@
 # 보안
 
 - JWT 토큰 기반 인증 (Access Token + Refresh Token)
-- 사용자별 데이터 격리 (Row Level Security)
+- 사용자별 데이터 격리 (Level Security)
 - API Rate Limiting (Redis 기반)
 - 입력 데이터 Sanitization
 

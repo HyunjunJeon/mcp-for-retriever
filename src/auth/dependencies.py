@@ -10,7 +10,6 @@ MCP 서버의 인증, 권한 관리, 서비스 인스턴스 생성을 담당합�
     - 역할 기반 접근 제어 (RBAC)
     - 서비스 인스턴스 싱글톤 관리
     - 사용자 권한 검증 미들웨어
-    - MCP 프록시 서비스 의존성 제공
 
 의존성 체계:
     1. get_auth_service(): 인증 서비스 (싱글톤)
@@ -18,7 +17,6 @@ MCP 서버의 인증, 권한 관리, 서비스 인스턴스 생성을 담당합�
     3. get_current_active_user(): 활성화된 사용자만 허용
     4. RoleChecker: 역할 기반 권한 검증
     5. get_rbac_service(): 권한 관리 서비스
-    6. get_mcp_proxy_service(): MCP 프록시 서비스
 
 사용 패턴:
     ```python
@@ -40,22 +38,20 @@ MCP 서버의 인증, 권한 관리, 서비스 인스턴스 생성을 담당합�
 
 from typing import Annotated, TYPE_CHECKING, Optional
 
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, status, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 from .models import UserResponse
-from .services import AuthService, AuthenticationError
-
-# 싱글톤 인스턴스 저장용
-_mcp_proxy_service_instance: Optional["MCPProxyService"] = None
+from .services import AuthenticationError
 
 if TYPE_CHECKING:
-    from .services import RBACService, MCPProxyService
+    from .services import RBACService
 
 
 # HTTP Bearer 토큰 인증 스키마 정의
 # Authorization 헤더에서 "Bearer <token>" 형식으로 토큰을 추출
-security = HTTPBearer()
+# auto_error=False로 설정하여 헤더가 없어도 에러를 발생시키지 않음 (쿠키 인증 지원)
+security = HTTPBearer(auto_error=False)
 
 
 # 싱글톤 패턴을 위한 전역 인스턴스 저장소
@@ -65,7 +61,7 @@ _jwt_service = None      # JWT 토큰 관리 서비스 인스턴스
 _auth_service = None     # 통합 인증 서비스 인스턴스
 
 
-def get_auth_service() -> AuthService:
+def get_auth_service():
     """
     인증 서비스 의존성 제공 (싱글톤 패턴)
     
@@ -109,7 +105,7 @@ def get_auth_service() -> AuthService:
         # 환경 변수에서 JWT 비밀 키 로드
         jwt_secret = os.getenv("JWT_SECRET_KEY", "your-secret-key-change-in-production")
         
-        # 사용자 저장소 인스턴스 생성 (싱글톤)
+        # 임시로 InMemory 사용 (SQLite 마이그레이션 별도 처리)
         if _user_repository is None:
             _user_repository = InMemoryUserRepository()
         
@@ -131,8 +127,8 @@ def get_auth_service() -> AuthService:
 
 
 async def get_current_user(
-    credentials: Annotated[HTTPAuthorizationCredentials, Depends(security)],
-    auth_service: Annotated[AuthService, Depends(get_auth_service)],
+    request: Request,
+    credentials: Annotated[Optional[HTTPAuthorizationCredentials], Depends(security)],
 ) -> UserResponse:
     """
     JWT Bearer 토큰으로 현재 인증된 사용자 조회
@@ -188,9 +184,45 @@ async def get_current_user(
         - 사용자 존재 여부 실시간 확인
         - 민감 정보 제외한 안전한 응답
     """
+    # 먼저 쿠키에서 토큰을 확인 (웹 UI용)
+    token = None
+    if "access_token" in request.cookies:
+        token = request.cookies["access_token"]
+    # 쿠키에 없으면 Authorization 헤더에서 확인
+    elif credentials:
+        token = credentials.credentials
+    
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="인증이 필요합니다",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
     try:
-        # AuthService를 통해 토큰 검증 및 사용자 조회
-        return await auth_service.get_current_user(credentials.credentials)
+        # SQLite 기반 인증 서비스 사용
+        from .services.auth_service_sqlite import SQLiteAuthService
+        from .services.jwt_service import JWTService
+        from .database import get_db
+        import os
+        
+        # JWT 서비스 생성
+        jwt_secret = os.getenv("JWT_SECRET_KEY", "your-secret-key-change-in-production")
+        jwt_service = JWTService(
+            secret_key=jwt_secret,
+            access_token_expire_minutes=30,
+            refresh_token_expire_minutes=60 * 24 * 7,
+        )
+        
+        # SQLite auth service 생성
+        auth_service = SQLiteAuthService(jwt_service)
+        
+        # 데이터베이스 세션 가져오기
+        async for db in get_db():
+            try:
+                return await auth_service.get_current_user(token, db)
+            finally:
+                await db.close()
     except AuthenticationError as e:
         # 인증 실패 시 HTTP 401 응답 (RFC 7235 준수)
         raise HTTPException(
@@ -301,61 +333,6 @@ def get_permission_service() -> "PermissionService":
     return PermissionService(db_conn=None)
 
 
-def get_mcp_proxy_service() -> "MCPProxyService":
-    """
-    MCP 프록시 서비스 의존성
-    
-    인증된 요청을 실제 MCP 서버로 프록시하는 서비스를 제공합니다.
-    사용자 인증과 권한 검증을 거친 후 MCP 서버의 도구들을 안전하게 호출할 수 있게 합니다.
-    
-    프록시 기능:
-        - JWT 토큰을 Internal API Key로 변환
-        - 사용자별 도구 접근 권한 검증
-        - 세밀한 리소스 레벨 권한 검증
-        - MCP 서버로 요청 전달 및 응답 반환
-        - 요청/응답 로깅 및 감사
-        
-    환경 변수:
-        - MCP_SERVER_URL: 실제 MCP 서버 주소 (기본값: http://localhost:8001)
-        - MCP_INTERNAL_API_KEY: MCP 서버 내부 인증키 (필수)
-        
-    의존성:
-        - RBACService: 역할 기반 권한 검증
-        - PermissionService: 세밀한 리소스 권한 검증
-        
-    Returns:
-        MCPProxyService: MCP 프록시 서비스 인스턴스
-        
-    보안 특징:
-        - 사용자 토큰을 내부 API 키로 안전하게 교환
-        - 역할 및 리소스별 권한 검증
-        - 민감한 정보 필터링
-        - 요청 추적 및 로깅
-    """
-    from .services import MCPProxyService
-    import os
-    
-    # 환경 변수에서 MCP 서버 설정 로드
-    mcp_server_url = os.getenv("MCP_SERVER_URL", "http://localhost:8001")
-    internal_api_key = os.getenv("MCP_INTERNAL_API_KEY", "")
-    
-    # 서비스 인스턴스 생성
-    rbac_service = get_rbac_service()
-    permission_service = get_permission_service()
-    
-    # 싱글톤 인스턴스 확인
-    global _mcp_proxy_service_instance
-    
-    if _mcp_proxy_service_instance is None:
-        # MCP 프록시 서비스 생성 (싱글톤)
-        _mcp_proxy_service_instance = MCPProxyService(
-            mcp_server_url=mcp_server_url,
-            rbac_service=rbac_service,
-            internal_api_key=internal_api_key,
-            permission_service=permission_service,
-        )
-    
-    return _mcp_proxy_service_instance
 
 
 class RoleChecker:

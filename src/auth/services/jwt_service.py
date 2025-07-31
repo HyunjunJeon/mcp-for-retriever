@@ -122,13 +122,15 @@ class JWTService:
         user_id: str,
         email: str,
         roles: list[str],
+        scopes: Optional[list[str]] = None,
+        resource_permissions: Optional[dict[str, list[str]]] = None,
         additional_claims: Optional[dict[str, Any]] = None,
     ) -> str:
         """
         JWT 액세스 토큰 생성
         
         사용자 정보를 바탕으로 API 접근용 액세스 토큰을 생성합니다.
-        짧은 수명(30분)으로 보안 위험을 최소화하며, 사용자 인증 정보를 포함합니다.
+        짧은 수명(30분)으로 보안 위험을 최소화하며, 사용자 인증 정보와 권한 스코프를 포함합니다.
         
         Args:
             user_id (str): 사용자 고유 식별자
@@ -138,6 +140,12 @@ class JWTService:
             roles (list[str]): 사용자 역할 목록
                 권한 검사에 사용되는 역할 정보
                 예: ["user", "admin", "moderator"]
+            scopes (Optional[list[str]]): OAuth2 스타일 권한 스코프 목록
+                세밀한 권한 제어를 위한 스코프 정보
+                예: ["read:vectors", "write:database", "admin:users"]
+            resource_permissions (Optional[dict[str, list[str]]]): 리소스별 세밀한 권한 매핑
+                특정 리소스에 대한 권한 정보 (자주 사용되는 권한만 토큰에 포함)
+                예: {"collection1": ["read", "write"], "table1": ["read"]}
             additional_claims (Optional[dict[str, Any]]): 추가 클레임
                 특별한 경우 토큰에 추가할 정보
                 
@@ -150,6 +158,8 @@ class JWTService:
             - sub: 사용자 ID (JWT 표준)
             - email: 사용자 이메일
             - roles: 역할 목록
+            - scopes: 권한 스코프 목록 (신규)
+            - resource_permissions: 리소스별 권한 매핑 (신규)
             - type: "access" (토큰 타입 구분)
             - exp: 만료 시각 (JWT 표준)
             - iat: 발급 시각 (JWT 표준)
@@ -158,6 +168,11 @@ class JWTService:
             - HMAC-SHA256 서명으로 무결성 보장
             - 짧은 수명으로 탈취 시 피해 최소화
             - 토큰 타입 구분으로 오용 방지
+            - 세밀한 권한 제어로 최소 권한 원칙 적용
+            
+        하위 호환성:
+            - 기존 토큰은 scopes, resource_permissions 없이도 정상 동작
+            - 새로운 필드들은 Optional로 처리되어 호환성 보장
             
         Example:
             ```python
@@ -165,6 +180,8 @@ class JWTService:
                 user_id="user123",
                 email="user@example.com",
                 roles=["user"],
+                scopes=["read:vectors", "write:database"],
+                resource_permissions={"collection1": ["read", "write"]},
                 additional_claims={"department": "engineering"}
             )
             ```
@@ -183,6 +200,13 @@ class JWTService:
             "iat": now,           # Issued at
         }
         
+        # 새로운 권한 필드들 추가 (하위 호환성을 위해 None이 아닌 경우만 포함)
+        if scopes is not None:
+            payload["scopes"] = scopes
+            
+        if resource_permissions is not None:
+            payload["resource_permissions"] = resource_permissions
+        
         # 추가 클레임이 있으면 페이로드에 병합
         if additional_claims:
             payload.update(additional_claims)
@@ -196,6 +220,7 @@ class JWTService:
             user_id=user_id,
             email=email,
             roles=roles,
+            scopes=scopes,
             expires_in_minutes=self.access_token_expire_minutes,
         )
         
@@ -235,7 +260,7 @@ class JWTService:
         JWT 토큰 디코딩 및 검증
         
         JWT 토큰의 서명을 검증하고 페이로드를 추출하여 TokenData 객체로 변환합니다.
-        토큰의 무결성, 만료 시간, 필수 필드를 모두 검증합니다.
+        토큰의 무결성, 만료 시간, 필수 필드를 모두 검증하며, 새로운 권한 필드들도 안전하게 처리합니다.
         
         Args:
             token (str): 검증할 JWT 토큰
@@ -251,13 +276,18 @@ class JWTService:
             2. 서명 검증 (HMAC-SHA256)
             3. 만료 시간 검증 (exp 클레임)
             4. 필수 필드 존재 검증 (sub, type)
-            5. TokenData 객체 생성
+            5. TokenData 객체 생성 (하위 호환성 고려)
             
         보안 특징:
             - 서명 위변조 검증으로 무결성 보장
             - 자동 만료 시간 검증
             - 안전한 예외 처리로 정보 노출 방지
             - 구조화된 로깅으로 보안 이벤트 추적
+            
+        하위 호환성:
+            - 기존 토큰 (scopes, resource_permissions 없음)도 정상 처리
+            - 새로운 필드들은 Optional로 안전하게 처리
+            - 필드가 없는 경우 None으로 기본값 설정
             
         실패 원인:
             - 잘못된 서명 (토큰 위변조)
@@ -271,6 +301,8 @@ class JWTService:
             if token_data:
                 user_id = token_data.user_id
                 roles = token_data.roles
+                scopes = token_data.scopes or []  # 하위 호환성
+                resource_perms = token_data.resource_permissions or {}
             else:
                 # 토큰 검증 실패 처리
                 raise AuthenticationError("Invalid token")
@@ -289,7 +321,7 @@ class JWTService:
                 logger.warning("토큰에 필수 필드 누락", payload=payload)
                 return None
             
-            # TokenData 객체 생성 (안전한 타입 변환)
+            # TokenData 객체 생성 (안전한 타입 변환 및 하위 호환성 보장)
             token_data = TokenData(
                 user_id=payload["sub"],
                 email=payload.get("email") if payload.get("email") else None,
@@ -298,6 +330,9 @@ class JWTService:
                 # timestamp를 datetime 객체로 변환
                 exp=datetime.fromtimestamp(payload["exp"], UTC) if "exp" in payload else None,
                 iat=datetime.fromtimestamp(payload["iat"], UTC) if "iat" in payload else None,
+                # 새로운 권한 필드들 (하위 호환성을 위해 안전하게 처리)
+                scopes=payload.get("scopes") if "scopes" in payload else None,
+                resource_permissions=payload.get("resource_permissions") if "resource_permissions" in payload else None,
             )
             
             return token_data

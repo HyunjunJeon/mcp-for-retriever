@@ -132,26 +132,26 @@ class User(BaseModel):
     비밀번호는 해시된 형태로만 저장됩니다.
     
     Attributes:
-        id (int): 사용자 고유 ID
+        id (str): 사용자 고유 ID (UUID)
         email (EmailStr): 이메일 주소 (로그인 ID로 사용)
         username (Optional[str]): 사용자명 (표시용)
-        hashed_password (str): bcrypt로 해시된 비밀번호
+        password_hash (str): bcrypt로 해시된 비밀번호
         is_active (bool): 계정 활성화 여부
         is_verified (bool): 이메일 인증 여부
         roles (list[str]): 사용자가 가진 역할 목록
         created_at (datetime): 계정 생성 시각
-        updated_at (datetime): 정보 수정 시각
+        updated_at (Optional[datetime]): 정보 수정 시각
     """
     
-    id: int
+    id: str
     email: EmailStr
     username: Optional[str] = None
-    hashed_password: str
+    password_hash: str
     is_active: bool = True
     is_verified: bool = False
     roles: list[str] = Field(default_factory=lambda: ["user"])
     created_at: datetime
-    updated_at: datetime
+    updated_at: Optional[datetime] = None
 
 
 class UserCreate(BaseModel):
@@ -224,7 +224,7 @@ class UserResponse(BaseModel):
     민감한 정보(비밀번호 등)는 제외됩니다.
     
     Attributes:
-        id (int): 사용자 고유 ID
+        id (str): 사용자 고유 ID (UUID)
         email (EmailStr): 이메일 주소
         username (Optional[str]): 사용자명
         is_active (bool): 계정 활성화 여부
@@ -233,7 +233,7 @@ class UserResponse(BaseModel):
         created_at (datetime): 계정 생성 시각
     """
     
-    id: int
+    id: str
     email: EmailStr
     username: Optional[str] = None
     is_active: bool
@@ -309,6 +309,8 @@ class TokenData(BaseModel):
         token_type (str): 토큰 타입 (access/refresh)
         exp (Optional[datetime]): 토큰 만료 시간
         iat (Optional[datetime]): 토큰 발급 시간
+        scopes (Optional[list[str]]): OAuth2 스타일 권한 스코프 목록
+        resource_permissions (Optional[dict[str, list[str]]]): 리소스별 세밀한 권한 매핑
     """
     
     user_id: str
@@ -317,6 +319,8 @@ class TokenData(BaseModel):
     token_type: str
     exp: Optional[datetime] = None
     iat: Optional[datetime] = None
+    scopes: Optional[list[str]] = Field(default=None)
+    resource_permissions: Optional[dict[str, list[str]]] = Field(default=None)
 
 
 class TokenRefresh(BaseModel):
@@ -372,6 +376,104 @@ class PasswordResetConfirm(BaseModel):
         return v
 
 
+# CRUD API용 모델들
+
+class ResourcePermissionCreate(BaseModel):
+    """리소스 권한 생성 요청 모델"""
+    user_id: Optional[int] = None
+    role_name: Optional[str] = None
+    resource_type: ResourceType
+    resource_name: str = Field(..., description="리소스 이름 또는 패턴 (예: 'public.*', 'users.documents')")
+    actions: list[ActionType]
+    conditions: Optional[dict[str, Any]] = None
+    expires_at: Optional[datetime] = None
+
+    @field_validator('actions')
+    @classmethod
+    def validate_actions(cls, v):
+        """액션 목록이 비어있지 않은지 확인"""
+        if not v:
+            raise ValueError('최소 하나의 액션이 필요합니다')
+        return v
+
+
+class ResourcePermissionUpdate(BaseModel):
+    """리소스 권한 수정 요청 모델"""
+    actions: Optional[list[ActionType]] = None
+    conditions: Optional[dict[str, Any]] = None
+    expires_at: Optional[datetime] = None
+
+
+class ResourcePermissionResponse(BaseModel):
+    """리소스 권한 응답 모델"""
+    id: int
+    user_id: Optional[int] = None
+    role_name: Optional[str] = None
+    resource_type: ResourceType
+    resource_name: str
+    actions: list[ActionType]
+    conditions: Optional[dict[str, Any]] = None
+    granted_at: datetime
+    granted_by: Optional[int] = None
+    expires_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class RoleCreate(BaseModel):
+    """역할 생성 요청 모델"""
+    name: str = Field(..., min_length=1, max_length=50)
+    description: Optional[str] = Field(None, max_length=255)
+    permissions: Optional[list[Permission]] = None
+
+
+class RoleUpdate(BaseModel):
+    """역할 수정 요청 모델"""
+    description: Optional[str] = Field(None, max_length=255)
+    permissions: Optional[list[Permission]] = None
+
+
+class RoleResponse(BaseModel):
+    """역할 응답 모델"""
+    name: str
+    description: Optional[str] = None
+    permissions: list[Permission]
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class PermissionAuditLog(BaseModel):
+    """권한 감사 로그 모델"""
+    id: int
+    action: str  # GRANT, REVOKE, CHECK
+    user_id: Optional[int] = None
+    target_user_id: Optional[int] = None
+    resource_type: Optional[str] = None
+    resource_name: Optional[str] = None
+    actions: Optional[list[str]] = None
+    result: Optional[bool] = None
+    reason: Optional[str] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class PermissionBulkGrant(BaseModel):
+    """권한 일괄 부여 요청 모델"""
+    permissions: list[ResourcePermissionCreate]
+    expires_at: Optional[datetime] = None
+
+
+class PermissionBulkRevoke(BaseModel):
+    """권한 일괄 회수 요청 모델"""
+    permission_ids: list[int]
+
+
 __all__ = [
     # 열거형
     "ResourceType",
@@ -397,4 +499,15 @@ __all__ = [
     # 비밀번호 재설정
     "PasswordReset",
     "PasswordResetConfirm",
+    
+    # CRUD API 모델
+    "ResourcePermissionCreate",
+    "ResourcePermissionUpdate", 
+    "ResourcePermissionResponse",
+    "RoleCreate",
+    "RoleUpdate",
+    "RoleResponse",
+    "PermissionAuditLog",
+    "PermissionBulkGrant",
+    "PermissionBulkRevoke",
 ]

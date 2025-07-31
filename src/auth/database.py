@@ -86,8 +86,14 @@ class User(Base):
     # 이메일: 로그인 ID로 사용, 고유 제약조건과 인덱스 적용
     email = Column(String, unique=True, nullable=False, index=True)
     
+    # 사용자명: 선택적 사용자 이름
+    username = Column(String, nullable=True)
+    
     # 해시된 비밀번호: bcrypt로 안전하게 해시된 비밀번호 저장
-    hashed_password = Column(String, nullable=False)
+    password_hash = Column(String, nullable=False)
+    
+    # 이메일 인증 상태
+    is_verified = Column(Boolean, default=False)
     
     # 계정 활성화 상태: 비활성화된 계정은 로그인 불가
     is_active = Column(Boolean, default=True)
@@ -98,9 +104,7 @@ class User(Base):
     # 수정 시각: 계정 정보 변경 시점 (UTC 기준, 자동 업데이트)
     updated_at = Column(DateTime, onupdate=lambda: datetime.now(UTC))
     
-    # 다대다 관계 정의
-    roles = relationship("user_roles", backref="user")  # 사용자의 역할들
-    permissions = relationship("user_permissions", backref="user")  # 사용자의 도구별 권한들
+    # 사용자 메타데이터는 별도 쿼리로 처리 (SQLite에서는 간단한 구조 유지)
 
 
 class RevokedToken(Base):
@@ -142,14 +146,15 @@ class RevokedToken(Base):
 
 
 # 데이터베이스 연결 설정
-# 환경변수에서 DATABASE_URL을 읽어오며, 기본값은 SQLite 파일 DB
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./auth.db")
+# 환경변수에서 AUTH_DATABASE_URL을 읽어오며, 기본값은 SQLite 파일 DB
+# Docker 환경에서는 /data/auth.db로 저장하여 볼륨 마운트 가능
+AUTH_DATABASE_URL = os.getenv("AUTH_DATABASE_URL", "sqlite+aiosqlite:///./auth.db")
 
 # 비동기 SQLAlchemy 엔진 생성
 # pool_pre_ping=True로 연결 유효성 자동 확인
 engine = create_async_engine(
-    DATABASE_URL,
-    echo=False,  # SQL 쿼리 로깅 비활성화 (production 권장)
+    AUTH_DATABASE_URL,
+    echo=os.getenv("SQLALCHEMY_ECHO", "False").lower() == "true",  # 환경변수로 SQL 로깅 제어
     pool_pre_ping=True  # 연결 풀에서 연결 사용 전 ping 테스트
 )
 

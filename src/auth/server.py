@@ -1,9 +1,9 @@
 """
-MCP 서버용 JWT 기반 인증 게이트웨이 서버
+JWT 기반 인증 및 권한 관리 서버
 
-이 모듈은 MCP(Model Context Protocol) 서버의 인증과 권한 관리를 담당하는
-FastAPI 기반 게이트웨이 서버를 구현합니다. 클라이언트의 모든 요청은
-이 게이트웨이를 통해 인증과 권한 검증을 거친 후 실제 MCP 서버로 전달됩니다.
+이 모듈은 JWT 기반 사용자 인증과 권한 관리를 담당하는 FastAPI 서버를 구현합니다.
+단순히 저장된 DB의 인증 정보를 관리하고, 자원에 대한 인가 정보를 관리하는
+CRUD Admin Page와 API를 제공합니다.
 
 주요 기능:
     사용자 인증:
@@ -18,17 +18,15 @@ FastAPI 기반 게이트웨이 서버를 구현합니다. 클라이언트의 모
         - 관리자 전용 기능 분리
         - 사용자별 접근 로그 기록
         
-    MCP 프록시:
-        - 인증된 요청을 실제 MCP 서버로 전달
-        - 배치 요청 처리 지원
-        - 요청/응답 로깅 및 모니터링
-        - 내부 API 키를 통한 MCP 서버 인증
-        
     사용자 관리:
         - 사용자 검색 및 조회
         - 관리자용 사용자 목록 및 통계
         - 사용자 프로필 관리
         - 최근 가입자 조회
+        
+    권한 관리 CRUD API:
+        - 자원에 대한 인가 정보 관리
+        - Admin Page를 위한 API 제공
 
 API 엔드포인트:
     인증 관련:
@@ -36,10 +34,6 @@ API 엔드포인트:
         - POST /auth/login: 로그인  
         - POST /auth/refresh: 토큰 갱신
         - GET /auth/me: 현재 사용자 정보 조회
-        
-    MCP 프록시:
-        - POST /mcp/proxy: 단일 MCP 요청 전달
-        - POST /mcp/batch: 배치 MCP 요청 전달
         
     사용자 검색:
         - GET /api/v1/users/search: 사용자 검색
@@ -65,8 +59,6 @@ API 엔드포인트:
 
 환경 변수:
     - JWT_SECRET_KEY: JWT 서명용 비밀 키 (필수)
-    - MCP_SERVER_URL: 실제 MCP 서버 주소
-    - MCP_INTERNAL_API_KEY: MCP 서버 내부 인증키
     - LOG_LEVEL: 로그 레벨 (DEBUG, INFO, WARNING, ERROR)
 
 서버 실행:
@@ -83,11 +75,13 @@ API 엔드포인트:
 
 from contextlib import asynccontextmanager
 from typing import Annotated
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from fastapi import FastAPI, Depends, HTTPException, status, Request
+from fastapi import FastAPI, Depends, HTTPException, status, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, HTMLResponse
-from sse_starlette.sse import EventSourceResponse
+from fasthtml.common import *
+from fastcore.xml import to_xml
 import structlog
 import uvicorn
 
@@ -96,21 +90,45 @@ from .models import (
     UserLogin,
     UserResponse,
     AuthTokens,
+    ResourcePermissionCreate,
+    ResourcePermissionUpdate,
+    ResourcePermissionResponse,
+    RoleCreate,
+    RoleUpdate,
+    RoleResponse,
+    ResourceType,
+    ActionType,
 )
 from .services import (
     AuthService,
     AuthenticationError,
-    MCPRequest,
-    MCPResponse,
-    MCPProxyService,
 )
 from .dependencies import (
     get_auth_service,
     get_current_user,
     get_current_active_user,
-    get_mcp_proxy_service,
     require_admin,
+    get_permission_service,
+    get_rbac_service,
 )
+from .database import get_db
+from .services.auth_service_sqlite import SQLiteAuthService
+from .services.jwt_service import JWTService
+from .repositories.sqlite_user_repository import SQLiteUserRepository
+
+
+# SQLite 기반 AuthService 의존성
+_sqlite_auth_service = None
+
+def get_sqlite_auth_service() -> SQLiteAuthService:
+    """SQLite 기반 AuthService 싱글톤"""
+    global _sqlite_auth_service
+    if _sqlite_auth_service is None:
+        import os
+        jwt_secret = os.getenv("JWT_SECRET_KEY", "your-secret-key-change-in-production")
+        jwt_service = JWTService(secret_key=jwt_secret)
+        _sqlite_auth_service = SQLiteAuthService(jwt_service)
+    return _sqlite_auth_service
 
 
 # 로거 설정
@@ -142,12 +160,13 @@ async def lifespan(app: FastAPI):
     데이터베이스 연결, 서비스 초기화, 리소스 정리 등을 담당합니다.
     
     시작 시 작업:
-        - 로깅 시스템 초기화 확인
-        - 서비스 의존성 준비 상태 확인
+        - SQLite 데이터베이스 초기화
+        - 테이블 생성 및 마이그레이션
+        - 초기 관리자 계정 생성
         - 서버 시작 로그 기록
         
     종료 시 작업:
-        - 활성 연결 정리
+        - 데이터베이스 연결 종료
         - 리소스 해제
         - 종료 로그 기록
         
@@ -160,16 +179,62 @@ async def lifespan(app: FastAPI):
     # 시작 시
     logger.info("인증 게이트웨이 서버 시작", port=8000)
     
+    # 데이터베이스 초기화
+    from .database import init_db, engine, async_session_maker
+    from .repositories.sqlite_user_repository import SQLiteUserRepository
+    from .services.auth_service_sqlite import SQLiteAuthService
+    from .services.jwt_service import JWTService
+    from .models import UserCreate
+    import os
+    
+    logger.info("데이터베이스 초기화 시작")
+    await init_db()
+    logger.info("데이터베이스 테이블 생성 완료")
+    
+    # 초기 관리자 계정 생성
+    try:
+        async with async_session_maker() as session:
+            repository = SQLiteUserRepository(session)
+            
+            # 관리자 계정이 이미 있는지 확인
+            admin_email = "admin@example.com"
+            existing_admin = await repository.get_by_email(admin_email)
+            
+            if not existing_admin:
+                # JWT 서비스 생성
+                jwt_secret = os.getenv("JWT_SECRET_KEY", "your-secret-key-change-in-production")
+                jwt_service = JWTService(secret_key=jwt_secret)
+                
+                # Auth 서비스 생성
+                auth_service = SQLiteAuthService(jwt_service)
+                
+                # 관리자 계정 생성
+                admin_data = UserCreate(
+                    email=admin_email,
+                    password="Admin123!",
+                    username="admin",
+                    roles=["admin", "user"]
+                )
+                
+                await auth_service.register(admin_data, session)
+                logger.info("초기 관리자 계정 생성 완료", email=admin_email)
+            else:
+                logger.info("관리자 계정이 이미 존재합니다", email=admin_email)
+                
+    except Exception as e:
+        logger.error("초기 관리자 계정 생성 실패", error=str(e))
+    
     yield
     
     # 종료 시
+    await engine.dispose()
     logger.info("인증 게이트웨이 서버 종료")
 
 
 # FastAPI 앱 생성
 app = FastAPI(
-    title="MCP Auth Gateway",
-    description="JWT 기반 인증 및 MCP 프록시 게이트웨이",
+    title="JWT Auth & Permission Management Server",
+    description="JWT 기반 인증 및 권한 관리 서버 - 사용자 인증과 자원 권한 관리를 위한 CRUD API 제공",
     version="1.0.0",
     lifespan=lifespan,
 )
@@ -191,7 +256,8 @@ app.add_middleware(
 @app.post("/auth/register", response_model=UserResponse)
 async def register(
     user_create: UserCreate,
-    auth_service: Annotated[AuthService, Depends(get_auth_service)],
+    auth_service: Annotated[SQLiteAuthService, Depends(get_sqlite_auth_service)],
+    db: Annotated[AsyncSession, Depends(get_db)],
 ):
     """
     새 사용자 계정 등록
@@ -223,7 +289,7 @@ async def register(
         - 등록 시도 로깅
     """
     try:
-        user = await auth_service.register(user_create)
+        user = await auth_service.register(user_create, db)
         logger.info("사용자 등록 성공", email=user.email)
         return user
     except AuthenticationError as e:
@@ -237,7 +303,9 @@ async def register(
 @app.post("/auth/login", response_model=AuthTokens)
 async def login(
     user_login: UserLogin,
-    auth_service: Annotated[AuthService, Depends(get_auth_service)],
+    auth_service: Annotated[SQLiteAuthService, Depends(get_sqlite_auth_service)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    response: Response,
 ):
     """
     사용자 로그인 및 JWT 토큰 발급
@@ -272,8 +340,19 @@ async def login(
         - WWW-Authenticate 헤더 포함
     """
     try:
-        tokens = await auth_service.login(user_login)
+        tokens = await auth_service.login(user_login, db)
         logger.info("로그인 성공", email=user_login.email)
+        
+        # JWT 토큰을 쿠키에도 저장 (웹 UI용)
+        response.set_cookie(
+            key="access_token",
+            value=tokens.access_token,
+            httponly=True,  # JavaScript에서 접근 불가 (XSS 방지)
+            secure=False,   # HTTPS가 아닌 환경에서도 동작 (개발용)
+            samesite="lax", # CSRF 방지
+            max_age=tokens.expires_in,  # 토큰 만료 시간과 동일
+        )
+        
         return tokens
     except AuthenticationError as e:
         logger.warning("로그인 실패", error=str(e))
@@ -287,7 +366,8 @@ async def login(
 @app.post("/auth/refresh", response_model=AuthTokens)
 async def refresh_tokens(
     refresh_token: str,
-    auth_service: Annotated[AuthService, Depends(get_auth_service)],
+    auth_service: Annotated[SQLiteAuthService, Depends(get_sqlite_auth_service)],
+    db: Annotated[AsyncSession, Depends(get_db)],
 ):
     """토큰 갱신"""
     try:
@@ -470,6 +550,12 @@ async def login_page():
                         // 로컬 스토리지에 토큰 저장 (E2E 테스트용)
                         localStorage.setItem('access_token', data.access_token);
                         localStorage.setItem('refresh_token', data.refresh_token);
+                        
+                        // 로그인 성공 후 admin 페이지로 리다이렉트
+                        messageDiv.innerHTML = '<p class="success">로그인 성공! 잠시 후 관리자 페이지로 이동합니다...</p>';
+                        setTimeout(() => {
+                            window.location.href = '/admin';
+                        }, 1500);
                     } else {
                         const errorMessage = data.detail || data.message || JSON.stringify(data);
                         messageDiv.innerHTML = `<p class="error">오류: ${errorMessage}</p>`;
@@ -511,436 +597,615 @@ async def login_page():
     return HTMLResponse(content=html_content)
 
 
-@app.get("/mcp/client-page", response_class=HTMLResponse)
-async def mcp_client_page():
-    """MCP 클라이언트 테스트 페이지 (E2E 테스트용)"""
-    html_content = """
-    <!DOCTYPE html>
-    <html lang="ko">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>MCP 클라이언트 테스트</title>
-        <style>
-            body { font-family: Arial, sans-serif; max-width: 1200px; margin: 20px auto; padding: 20px; }
-            .container { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
-            .section { border: 1px solid #ddd; padding: 20px; border-radius: 8px; }
-            h1, h2 { color: #333; }
-            .form-group { margin-bottom: 15px; }
-            label { display: block; margin-bottom: 5px; font-weight: bold; }
-            input, select, textarea { width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px; }
-            textarea { min-height: 100px; font-family: monospace; }
-            button { background-color: #007bff; color: white; padding: 10px 20px; border: none; border-radius: 4px; cursor: pointer; margin-right: 10px; }
-            button:hover { background-color: #0056b3; }
-            button:disabled { background-color: #ccc; cursor: not-allowed; }
-            .error { color: red; }
-            .success { color: green; }
-            .result { background-color: #f8f9fa; padding: 15px; border-radius: 4px; margin-top: 15px; }
-            .json { white-space: pre-wrap; font-family: monospace; font-size: 14px; }
-            .tool-item { padding: 10px; margin: 5px 0; background: #e9ecef; border-radius: 4px; cursor: pointer; }
-            .tool-item:hover { background: #dee2e6; }
-            .tool-name { font-weight: bold; }
-            .tool-description { font-size: 14px; color: #666; }
-            #loginStatus { padding: 10px; margin-bottom: 20px; border-radius: 4px; }
-            #loginStatus.success { background-color: #d4edda; color: #155724; }
-            #loginStatus.error { background-color: #f8d7da; color: #721c24; }
-        </style>
-    </head>
-    <body>
-        <h1>MCP 클라이언트 테스트</h1>
-        
-        <div id="loginStatus"></div>
-        
-        <div class="container">
-            <div class="section">
-                <h2>인증 정보</h2>
-                <div class="form-group">
-                    <label for="accessToken">Access Token:</label>
-                    <textarea id="accessToken" placeholder="로그인 후 자동으로 채워집니다"></textarea>
-                </div>
-                <button onclick="loadTokenFromStorage()">로컬 스토리지에서 토큰 불러오기</button>
-                <button onclick="clearAuth()">인증 정보 초기화</button>
-            </div>
-            
-            <div class="section">
-                <h2>MCP 요청</h2>
-                <div class="form-group">
-                    <label for="method">메서드:</label>
-                    <select id="method" onchange="updateParamsTemplate()">
-                        <option value="tools/list">tools/list - 도구 목록 조회</option>
-                        <option value="tools/call">tools/call - 도구 호출</option>
-                    </select>
-                </div>
-                <div class="form-group">
-                    <label for="params">파라미터 (JSON):</label>
-                    <textarea id="params">{}</textarea>
-                </div>
-                <button onclick="sendMCPRequest()">요청 전송</button>
-                <button onclick="clearResults()">결과 초기화</button>
-            </div>
-        </div>
-        
-        <div class="section" style="margin-top: 20px;">
-            <h2>도구 목록</h2>
-            <div id="toolsList"></div>
-        </div>
-        
-        <div class="section" style="margin-top: 20px;">
-            <h2>응답 결과</h2>
-            <div id="results"></div>
-        </div>
-        
-        <script>
-            // MCP 클라이언트 클래스
-            class MCPClient {
-                constructor(baseUrl, token) {
-                    this.baseUrl = baseUrl;
-                    this.token = token;
-                    this.requestId = 1;
-                }
-                
-                async sendRequest(method, params = {}) {
-                    const request = {
-                        jsonrpc: "2.0",
-                        id: this.requestId++,
-                        method: method,
-                        params: params
-                    };
-                    
-                    try {
-                        const response = await fetch(`${this.baseUrl}/mcp/proxy`, {
-                            method: 'POST',
-                            headers: {
-                                'Content-Type': 'application/json',
-                                'Authorization': `Bearer ${this.token}`
-                            },
-                            body: JSON.stringify(request)
-                        });
-                        
-                        if (!response.ok) {
-                            const error = await response.text();
-                            throw new Error(`HTTP ${response.status}: ${error}`);
-                        }
-                        
-                        return await response.json();
-                    } catch (error) {
-                        throw error;
-                    }
-                }
-                
-                async listTools() {
-                    return await this.sendRequest('tools/list');
-                }
-                
-                async callTool(name, args = {}) {
-                    return await this.sendRequest('tools/call', { name, arguments: args });
-                }
-            }
-            
-            let mcpClient = null;
-            
-            // 페이지 로드 시 토큰 확인
-            window.addEventListener('DOMContentLoaded', () => {
-                loadTokenFromStorage();
-            });
-            
-            function loadTokenFromStorage() {
-                const token = localStorage.getItem('access_token');
-                if (token) {
-                    document.getElementById('accessToken').value = token;
-                    mcpClient = new MCPClient('', token);
-                    updateLoginStatus('토큰이 로드되었습니다. MCP 요청을 보낼 수 있습니다.', 'success');
-                    // 자동으로 도구 목록 로드
-                    loadToolsList();
-                } else {
-                    updateLoginStatus('로그인이 필요합니다. 먼저 로그인 페이지에서 로그인하세요.', 'error');
-                }
-            }
-            
-            function updateLoginStatus(message, type) {
-                const statusDiv = document.getElementById('loginStatus');
-                statusDiv.textContent = message;
-                statusDiv.className = type;
-            }
-            
-            function clearAuth() {
-                document.getElementById('accessToken').value = '';
-                localStorage.removeItem('access_token');
-                mcpClient = null;
-                updateLoginStatus('인증 정보가 초기화되었습니다.', 'error');
-                document.getElementById('toolsList').innerHTML = '';
-            }
-            
-            function updateParamsTemplate() {
-                const method = document.getElementById('method').value;
-                const paramsTextarea = document.getElementById('params');
-                
-                if (method === 'tools/list') {
-                    paramsTextarea.value = '{}';
-                } else if (method === 'tools/call') {
-                    paramsTextarea.value = JSON.stringify({
-                        name: 'search_web',
-                        arguments: {
-                            query: 'MCP protocol',
-                            limit: 5
-                        }
-                    }, null, 2);
-                }
-            }
-            
-            async function sendMCPRequest() {
-                const token = document.getElementById('accessToken').value;
-                if (!token) {
-                    alert('Access Token이 필요합니다.');
-                    return;
-                }
-                
-                const method = document.getElementById('method').value;
-                let params;
-                
-                try {
-                    params = JSON.parse(document.getElementById('params').value);
-                } catch (e) {
-                    alert('파라미터가 올바른 JSON 형식이 아닙니다.');
-                    return;
-                }
-                
-                mcpClient = new MCPClient('', token);
-                
-                try {
-                    showResult('요청 전송 중...', 'info');
-                    const response = await mcpClient.sendRequest(method, params);
-                    showResult(JSON.stringify(response, null, 2), 'success');
-                    
-                    // tools/list 응답이면 도구 목록 업데이트
-                    if (method === 'tools/list' && response.result && response.result.tools) {
-                        displayTools(response.result.tools);
-                    }
-                } catch (error) {
-                    showResult(`오류: ${error.message}`, 'error');
-                }
-            }
-            
-            async function loadToolsList() {
-                if (!mcpClient) return;
-                
-                try {
-                    const response = await mcpClient.listTools();
-                    if (response.result && response.result.tools) {
-                        displayTools(response.result.tools);
-                    }
-                } catch (error) {
-                    console.error('도구 목록 로드 실패:', error);
-                }
-            }
-            
-            function displayTools(tools) {
-                const toolsList = document.getElementById('toolsList');
-                toolsList.innerHTML = '';
-                
-                tools.forEach(tool => {
-                    const toolItem = document.createElement('div');
-                    toolItem.className = 'tool-item';
-                    toolItem.innerHTML = `
-                        <div class="tool-name">${tool.name}</div>
-                        <div class="tool-description">${tool.description || '설명 없음'}</div>
-                    `;
-                    toolItem.onclick = () => selectTool(tool.name);
-                    toolsList.appendChild(toolItem);
-                });
-            }
-            
-            function selectTool(toolName) {
-                document.getElementById('method').value = 'tools/call';
-                const exampleParams = {
-                    search_web: {
-                        name: 'search_web',
-                        arguments: {
-                            query: 'FastMCP tutorial',
-                            limit: 5
-                        }
-                    },
-                    search_vectors: {
-                        name: 'search_vectors',
-                        arguments: {
-                            query: 'machine learning',
-                            collection: 'documents',
-                            limit: 10
-                        }
-                    },
-                    search_database: {
-                        name: 'search_database',
-                        arguments: {
-                            query: 'SELECT * FROM users LIMIT 5'
-                        }
-                    },
-                    search_all: {
-                        name: 'search_all',
-                        arguments: {
-                            query: 'AI technology',
-                            limit: 3
-                        }
-                    }
-                };
-                
-                const params = exampleParams[toolName] || {
-                    name: toolName,
-                    arguments: {}
-                };
-                
-                document.getElementById('params').value = JSON.stringify(params, null, 2);
-            }
-            
-            function showResult(message, type) {
-                const resultsDiv = document.getElementById('results');
-                const resultDiv = document.createElement('div');
-                resultDiv.className = `result ${type}`;
-                
-                const timestamp = new Date().toLocaleTimeString();
-                resultDiv.innerHTML = `
-                    <strong>[${timestamp}]</strong>
-                    <pre class="json">${message}</pre>
-                `;
-                
-                resultsDiv.insertBefore(resultDiv, resultsDiv.firstChild);
-            }
-            
-            function clearResults() {
-                document.getElementById('results').innerHTML = '';
-            }
-        </script>
-    </body>
-    </html>
-    """
-    return HTMLResponse(content=html_content)
 
 
-# === MCP 프록시 엔드포인트 ===
+# === 권한 관리 API (Admin Page용) ===
 
-@app.post("/mcp/proxy", response_model=MCPResponse)
-async def proxy_mcp_request(
-    request: MCPRequest,
-    current_user: Annotated[UserResponse, Depends(get_current_active_user)],
-    mcp_proxy: Annotated[MCPProxyService, Depends(get_mcp_proxy_service)],
+@app.get("/api/v1/permissions/resources", response_model=list[ResourcePermissionResponse])
+async def list_resource_permissions(
+    current_user: Annotated[UserResponse, Depends(require_admin)],
+    permission_service: Annotated["PermissionService", Depends(get_permission_service)],
+    resource_type: Optional[ResourceType] = None,
+    resource_name: Optional[str] = None,
+    user_id: Optional[int] = None,
+    role_name: Optional[str] = None,
+    skip: int = 0,
+    limit: int = 50
 ):
-    """
-    인증된 MCP 요청을 실제 MCP 서버로 프록시
-    
-    사용자의 JWT 토큰을 검증하고 권한을 확인한 후,
-    요청을 내부 API 키와 함께 실제 MCP 서버로 전달합니다.
-    모든 요청/응답은 로깅되어 감사 추적이 가능합니다.
-    
-    Args:
-        request (MCPRequest): MCP 프로토콜 요청
-            - jsonrpc: "2.0"
-            - method: MCP 메서드 (예: "tools/call")
-            - params: 도구 호출 매개변수
-            - id: 요청 식별자
-        current_user (UserResponse): 인증된 활성 사용자
-        mcp_proxy (MCPProxyService): MCP 프록시 서비스
-        
-    Returns:
-        MCPResponse: MCP 서버 응답
-            - jsonrpc: "2.0"
-            - result: 성공 시 결과 데이터
-            - error: 실패 시 에러 정보
-            - id: 요청과 동일한 식별자
-            
-    처리 과정:
-        1. 사용자 인증 및 활성 상태 확인
-        2. 요청하는 도구에 대한 권한 검증
-        3. 내부 API 키로 MCP 서버 인증
-        4. 요청 전달 및 응답 수신
-        5. 응답 로깅 및 클라이언트 반환
-        
-    보안 특징:
-        - JWT 토큰 기반 사용자 인증
-        - 역할 기반 도구 접근 권한 검증
-        - 내부 API 키로 MCP 서버 보호
-        - 모든 요청/응답 구조화된 로깅
-        - 에러 정보 필터링으로 정보 유출 방지
-    """
-    logger.info(
-        "MCP 요청 수신",
-        user_id=current_user.id,
-        method=request.method,
-        tool_name=request.params.get("name") if request.params else None,
-    )
-    
-    # 요청 전달
-    response = await mcp_proxy.forward_request(
-        request=request,
-        user_roles=current_user.roles,
-        user_id=current_user.id,
-    )
-    
-    # 에러 로깅
-    if response.error:
-        logger.warning(
-            "MCP 요청 처리 실패",
-            user_id=current_user.id,
-            error=response.error,
+    """리소스 권한 목록 조회 (관리자 전용)"""
+    if not permission_service.db_conn:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="데이터베이스 연결이 필요합니다"
         )
     
-    return response
-
-
-@app.post("/mcp/batch", response_model=list[MCPResponse])
-async def proxy_batch_mcp_requests(
-    requests: list[MCPRequest],
-    current_user: Annotated[UserResponse, Depends(get_current_active_user)],
-    mcp_proxy: Annotated[MCPProxyService, Depends(get_mcp_proxy_service)],
-):
-    """배치 MCP 요청 프록시"""
-    logger.info(
-        "배치 MCP 요청 수신",
-        user_id=current_user.id,
-        request_count=len(requests),
-    )
+    # 쿼리 조건 구성
+    conditions = []
+    params = []
     
-    responses = await mcp_proxy.batch_forward_requests(
-        requests=requests,
-        user_roles=current_user.roles,
-        user_id=current_user.id,
-    )
+    if resource_type:
+        conditions.append(f"resource_type = ${len(params) + 1}")
+        params.append(resource_type.value)
     
-    return responses
-
-
-@app.post("/mcp/sse")
-async def proxy_mcp_sse(
-    request: Request,
-    current_user: Annotated[UserResponse, Depends(get_current_active_user)],
-    mcp_proxy: Annotated[MCPProxyService, Depends(get_mcp_proxy_service)],
-):
-    """MCP SSE 요청 프록시
+    if resource_name:
+        conditions.append(f"resource_name ILIKE ${len(params) + 1}")
+        params.append(f"%{resource_name}%")
     
-    FastMCP의 Streamable HTTP 모드를 지원하는 SSE 프록시 엔드포인트.
-    클라이언트의 SSE 요청을 MCP 서버로 전달하고 응답 스트림을 프록시합니다.
+    if user_id:
+        conditions.append(f"user_id = ${len(params) + 1}")
+        params.append(user_id)
+    
+    if role_name:
+        conditions.append(f"role_name = ${len(params) + 1}")
+        params.append(role_name)
+    
+    where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    
+    query = f"""
+        SELECT id, user_id, role_name, resource_type, resource_name, 
+               actions, conditions, granted_at, granted_by, expires_at
+        FROM resource_permissions
+        {where_clause}
+        ORDER BY granted_at DESC
+        LIMIT ${len(params) + 1} OFFSET ${len(params) + 2}
     """
-    # 요청 바디 읽기
-    request_data = await request.json()
+    params.extend([limit, skip])
     
-    logger.info(
-        "MCP SSE 요청 수신",
-        user_id=current_user.id,
-        method=request_data.get("method"),
-    )
+    try:
+        rows = await permission_service.db_conn.fetch(query, *params)
+        
+        permissions = []
+        for row in rows:
+            perm = ResourcePermissionResponse(
+                id=row["id"],
+                user_id=row["user_id"],
+                role_name=row["role_name"],
+                resource_type=ResourceType(row["resource_type"]),
+                resource_name=row["resource_name"],
+                actions=[ActionType(a) for a in row["actions"]],
+                conditions=row["conditions"],
+                granted_at=row["granted_at"],
+                granted_by=row["granted_by"],
+                expires_at=row["expires_at"]
+            )
+            permissions.append(perm)
+        
+        return permissions
+        
+    except Exception as e:
+        logger.error("권한 목록 조회 실패", error=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="권한 목록 조회에 실패했습니다"
+        )
+
+
+@app.post("/api/v1/permissions/resources", response_model=ResourcePermissionResponse)
+async def create_resource_permission(
+    permission_data: ResourcePermissionCreate,
+    current_user: Annotated[UserResponse, Depends(require_admin)],
+    permission_service: Annotated["PermissionService", Depends(get_permission_service)],
+):
+    """리소스 권한 생성 (관리자 전용)"""
+    if not permission_service.db_conn:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="데이터베이스 연결이 필요합니다"
+        )
     
-    # 원본 헤더 추출 (민감한 정보는 프록시 서비스에서 필터링)
-    headers = dict(request.headers)
+    # user_id와 role_name 중 하나는 필수
+    if not permission_data.user_id and not permission_data.role_name:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="user_id 또는 role_name 중 하나는 필수입니다"
+        )
     
-    # SSE 스트림 생성기
-    async def event_generator():
-        async for event in mcp_proxy.forward_sse_request(
-            request_data=request_data,
-            user_roles=current_user.roles,
-            headers=headers,
-        ):
-            yield event
+    try:
+        await permission_service.grant_permission(
+            user_id=permission_data.user_id,
+            role_name=permission_data.role_name,
+            resource_type=permission_data.resource_type,
+            resource_name=permission_data.resource_name,
+            actions=permission_data.actions,
+            granted_by=current_user.id
+        )
+        
+        # 생성된 권한 조회하여 반환
+        query = """
+            SELECT id, user_id, role_name, resource_type, resource_name, 
+                   actions, conditions, granted_at, granted_by, expires_at
+            FROM resource_permissions
+            WHERE resource_type = $1 AND resource_name = $2
+              AND (user_id = $3 OR role_name = $4)
+            ORDER BY granted_at DESC
+            LIMIT 1
+        """
+        
+        row = await permission_service.db_conn.fetchrow(
+            query,
+            permission_data.resource_type.value,
+            permission_data.resource_name,
+            permission_data.user_id,
+            permission_data.role_name
+        )
+        
+        if not row:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="권한 생성 후 조회에 실패했습니다"
+            )
+        
+        return ResourcePermissionResponse(
+            id=row["id"],
+            user_id=row["user_id"],
+            role_name=row["role_name"],
+            resource_type=ResourceType(row["resource_type"]),
+            resource_name=row["resource_name"],
+            actions=[ActionType(a) for a in row["actions"]],
+            conditions=row["conditions"],
+            granted_at=row["granted_at"],
+            granted_by=row["granted_by"],
+            expires_at=row["expires_at"]
+        )
+        
+    except Exception as e:
+        logger.error("권한 생성 실패", error=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"권한 생성에 실패했습니다: {str(e)}"
+        )
+
+
+@app.put("/api/v1/permissions/resources/{permission_id}", response_model=ResourcePermissionResponse)
+async def update_resource_permission(
+    permission_id: int,
+    permission_data: ResourcePermissionUpdate,
+    current_user: Annotated[UserResponse, Depends(require_admin)],
+    permission_service: Annotated["PermissionService", Depends(get_permission_service)],
+):
+    """리소스 권한 수정 (관리자 전용)"""
+    if not permission_service.db_conn:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="데이터베이스 연결이 필요합니다"
+        )
     
-    # EventSourceResponse로 SSE 스트림 반환
-    return EventSourceResponse(event_generator())
+    try:
+        # 기존 권한 확인
+        existing_query = """
+            SELECT id, user_id, role_name, resource_type, resource_name, 
+                   actions, conditions, granted_at, granted_by, expires_at
+            FROM resource_permissions
+            WHERE id = $1
+        """
+        
+        existing_row = await permission_service.db_conn.fetchrow(existing_query, permission_id)
+        if not existing_row:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="권한을 찾을 수 없습니다"
+            )
+        
+        # 업데이트할 필드들 구성
+        update_fields = []
+        params = []
+        
+        if permission_data.actions is not None:
+            update_fields.append(f"actions = ${len(params) + 1}")
+            params.append([a.value for a in permission_data.actions])
+        
+        if permission_data.conditions is not None:
+            update_fields.append(f"conditions = ${len(params) + 1}")
+            params.append(permission_data.conditions)
+        
+        if permission_data.expires_at is not None:
+            update_fields.append(f"expires_at = ${len(params) + 1}")
+            params.append(permission_data.expires_at)
+        
+        update_fields.append(f"granted_by = ${len(params) + 1}")
+        params.append(current_user.id)
+        
+        update_fields.append(f"granted_at = ${len(params) + 1}")
+        params.append("NOW()")
+        
+        if not update_fields:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="업데이트할 필드가 없습니다"
+            )
+        
+        # 업데이트 쿼리 실행
+        update_query = f"""
+            UPDATE resource_permissions
+            SET {', '.join(update_fields)}
+            WHERE id = ${len(params) + 1}
+            RETURNING id, user_id, role_name, resource_type, resource_name, 
+                      actions, conditions, granted_at, granted_by, expires_at
+        """
+        params.append(permission_id)
+        
+        updated_row = await permission_service.db_conn.fetchrow(update_query, *params)
+        
+        # 캐시 클리어
+        if existing_row["user_id"]:
+            permission_service.clear_cache(existing_row["user_id"])
+        
+        return ResourcePermissionResponse(
+            id=updated_row["id"],
+            user_id=updated_row["user_id"],
+            role_name=updated_row["role_name"],
+            resource_type=ResourceType(updated_row["resource_type"]),
+            resource_name=updated_row["resource_name"],
+            actions=[ActionType(a) for a in updated_row["actions"]],
+            conditions=updated_row["conditions"],
+            granted_at=updated_row["granted_at"],
+            granted_by=updated_row["granted_by"],
+            expires_at=updated_row["expires_at"]
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("권한 수정 실패", error=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"권한 수정에 실패했습니다: {str(e)}"
+        )
+
+
+@app.delete("/api/v1/permissions/resources/{permission_id}")
+async def delete_resource_permission(
+    permission_id: int,
+    current_user: Annotated[UserResponse, Depends(require_admin)],
+    permission_service: Annotated["PermissionService", Depends(get_permission_service)],
+):
+    """리소스 권한 삭제 (관리자 전용)"""
+    if not permission_service.db_conn:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="데이터베이스 연결이 필요합니다"
+        )
+    
+    try:
+        # 기존 권한 확인 및 사용자 ID 가져오기
+        check_query = """
+            SELECT user_id, role_name, resource_type, resource_name
+            FROM resource_permissions
+            WHERE id = $1
+        """
+        
+        existing_row = await permission_service.db_conn.fetchrow(check_query, permission_id)
+        if not existing_row:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="권한을 찾을 수 없습니다"
+            )
+        
+        # 권한 삭제
+        delete_query = "DELETE FROM resource_permissions WHERE id = $1"
+        await permission_service.db_conn.execute(delete_query, permission_id)
+        
+        # 캐시 클리어
+        if existing_row["user_id"]:
+            permission_service.clear_cache(existing_row["user_id"])
+        
+        logger.info(
+            "권한 삭제 완료",
+            permission_id=permission_id,
+            admin_id=current_user.id,
+            user_id=existing_row["user_id"],
+            role_name=existing_row["role_name"]
+        )
+        
+        return {"message": "권한이 성공적으로 삭제되었습니다"}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("권한 삭제 실패", error=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"권한 삭제에 실패했습니다: {str(e)}"
+        )
+
+
+# === 사용자별 권한 관리 API ===
+
+@app.get("/api/v1/users/{user_id}/permissions", response_model=list[ResourcePermissionResponse])
+async def get_user_permissions(
+    user_id: int,
+    current_user: Annotated[UserResponse, Depends(require_admin)],
+    permission_service: Annotated["PermissionService", Depends(get_permission_service)],
+):
+    """사용자의 리소스 권한 조회 (관리자 전용)"""
+    if not permission_service.db_conn:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="데이터베이스 연결이 필요합니다"
+        )
+    
+    try:
+        # 사용자 존재 확인
+        auth_service = get_auth_service()
+        user = await auth_service.get_user_by_id(str(user_id))
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="사용자를 찾을 수 없습니다"
+            )
+        
+        query = """
+            SELECT id, user_id, role_name, resource_type, resource_name, 
+                   actions, conditions, granted_at, granted_by, expires_at
+            FROM resource_permissions
+            WHERE user_id = $1
+            ORDER BY granted_at DESC
+        """
+        
+        rows = await permission_service.db_conn.fetch(query, user_id)
+        
+        permissions = []
+        for row in rows:
+            perm = ResourcePermissionResponse(
+                id=row["id"],
+                user_id=row["user_id"],
+                role_name=row["role_name"],
+                resource_type=ResourceType(row["resource_type"]),
+                resource_name=row["resource_name"],
+                actions=[ActionType(a) for a in row["actions"]],
+                conditions=row["conditions"],
+                granted_at=row["granted_at"],
+                granted_by=row["granted_by"],
+                expires_at=row["expires_at"]
+            )
+            permissions.append(perm)
+        
+        return permissions
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("사용자 권한 조회 실패", error=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="사용자 권한 조회에 실패했습니다"
+        )
+
+
+@app.post("/api/v1/users/{user_id}/permissions", response_model=ResourcePermissionResponse)
+async def grant_user_permission(
+    user_id: int,
+    permission_data: ResourcePermissionCreate,
+    current_user: Annotated[UserResponse, Depends(require_admin)],
+    permission_service: Annotated["PermissionService", Depends(get_permission_service)],
+):
+    """사용자에게 권한 부여 (관리자 전용)"""
+    if not permission_service.db_conn:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="데이터베이스 연결이 필요합니다"
+        )
+    
+    try:
+        # 사용자 존재 확인
+        auth_service = get_auth_service()
+        user = await auth_service.get_user_by_id(str(user_id))
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="사용자를 찾을 수 없습니다"
+            )
+        
+        # 사용자 ID 강제 설정 (URL 파라미터 우선)
+        permission_data.user_id = user_id
+        permission_data.role_name = None
+        
+        await permission_service.grant_permission(
+            user_id=user_id,
+            role_name=None,
+            resource_type=permission_data.resource_type,
+            resource_name=permission_data.resource_name,
+            actions=permission_data.actions,
+            granted_by=current_user.id
+        )
+        
+        # 생성된 권한 조회하여 반환
+        query = """
+            SELECT id, user_id, role_name, resource_type, resource_name, 
+                   actions, conditions, granted_at, granted_by, expires_at
+            FROM resource_permissions
+            WHERE user_id = $1 AND resource_type = $2 AND resource_name = $3
+            ORDER BY granted_at DESC
+            LIMIT 1
+        """
+        
+        row = await permission_service.db_conn.fetchrow(
+            query,
+            user_id,
+            permission_data.resource_type.value,
+            permission_data.resource_name
+        )
+        
+        if not row:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="권한 생성 후 조회에 실패했습니다"
+            )
+        
+        return ResourcePermissionResponse(
+            id=row["id"],
+            user_id=row["user_id"],
+            role_name=row["role_name"],
+            resource_type=ResourceType(row["resource_type"]),
+            resource_name=row["resource_name"],
+            actions=[ActionType(a) for a in row["actions"]],
+            conditions=row["conditions"],
+            granted_at=row["granted_at"],
+            granted_by=row["granted_by"],
+            expires_at=row["expires_at"]
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("사용자 권한 부여 실패", error=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"사용자 권한 부여에 실패했습니다: {str(e)}"
+        )
+
+
+# === 역할 관리 API ===
+
+@app.get("/api/v1/roles", response_model=list[RoleResponse])
+async def list_roles(
+    current_user: Annotated[UserResponse, Depends(require_admin)],
+    rbac_service: Annotated["RBACService", Depends(get_rbac_service)],
+):
+    """역할 목록 조회 (관리자 전용)"""
+    try:
+        roles = []
+        for role_name, permissions in rbac_service.role_permissions.items():
+            role = RoleResponse(
+                name=role_name,
+                description=f"{role_name} 역할",
+                permissions=permissions
+            )
+            roles.append(role)
+        
+        return roles
+        
+    except Exception as e:
+        logger.error("역할 목록 조회 실패", error=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="역할 목록 조회에 실패했습니다"
+        )
+
+
+@app.post("/api/v1/roles", response_model=RoleResponse)
+async def create_role(
+    role_data: RoleCreate,
+    current_user: Annotated[UserResponse, Depends(require_admin)],
+    rbac_service: Annotated["RBACService", Depends(get_rbac_service)],
+):
+    """새 역할 생성 (관리자 전용)"""
+    try:
+        if role_data.name in rbac_service.role_permissions:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"역할 '{role_data.name}'이 이미 존재합니다"
+            )
+        
+        # 새 역할 생성
+        permissions = role_data.permissions or []
+        rbac_service.role_permissions[role_data.name] = permissions
+        
+        logger.info(
+            "새 역할 생성",
+            role_name=role_data.name,
+            admin_id=current_user.id,
+            permissions_count=len(permissions)
+        )
+        
+        return RoleResponse(
+            name=role_data.name,
+            description=role_data.description,
+            permissions=permissions
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("역할 생성 실패", error=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"역할 생성에 실패했습니다: {str(e)}"
+        )
+
+
+@app.put("/api/v1/roles/{role_name}", response_model=RoleResponse)
+async def update_role(
+    role_name: str,
+    role_data: RoleUpdate,
+    current_user: Annotated[UserResponse, Depends(require_admin)],
+    rbac_service: Annotated["RBACService", Depends(get_rbac_service)],
+):
+    """역할 수정 (관리자 전용)"""
+    try:
+        if role_name not in rbac_service.role_permissions:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"역할 '{role_name}'을 찾을 수 없습니다"
+            )
+        
+        # 권한 업데이트
+        if role_data.permissions is not None:
+            rbac_service.role_permissions[role_name] = role_data.permissions
+        
+        logger.info(
+            "역할 수정 완료",
+            role_name=role_name,
+            admin_id=current_user.id
+        )
+        
+        return RoleResponse(
+            name=role_name,
+            description=role_data.description,
+            permissions=rbac_service.role_permissions[role_name]
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("역할 수정 실패", error=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"역할 수정에 실패했습니다: {str(e)}"
+        )
+
+
+@app.delete("/api/v1/roles/{role_name}")
+async def delete_role(
+    role_name: str,
+    current_user: Annotated[UserResponse, Depends(require_admin)],
+    rbac_service: Annotated["RBACService", Depends(get_rbac_service)],
+):
+    """역할 삭제 (관리자 전용)"""
+    try:
+        if role_name not in rbac_service.role_permissions:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"역할 '{role_name}'을 찾을 수 없습니다"
+            )
+        
+        # 기본 역할 삭제 방지
+        if role_name in ["admin", "user", "guest"]:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"기본 역할 '{role_name}'은 삭제할 수 없습니다"
+            )
+        
+        # 역할 삭제
+        del rbac_service.role_permissions[role_name]
+        
+        logger.info(
+            "역할 삭제 완료",
+            role_name=role_name,
+            admin_id=current_user.id
+        )
+        
+        return {"message": f"역할 '{role_name}'이 성공적으로 삭제되었습니다"}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("역할 삭제 실패", error=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"역할 삭제에 실패했습니다: {str(e)}"
+        )
+
 
 
 # === 사용자 검색 엔드포인트 ===
@@ -948,7 +1213,8 @@ async def proxy_mcp_sse(
 @app.get("/api/v1/users/search", response_model=list[UserResponse])
 async def search_users(
     current_user: Annotated[UserResponse, Depends(get_current_active_user)],
-    auth_service: Annotated[AuthService, Depends(get_auth_service)],
+    auth_service: Annotated[SQLiteAuthService, Depends(get_sqlite_auth_service)],
+    db: Annotated[AsyncSession, Depends(get_db)],
     q: str = "",
     limit: int = 10
 ):
@@ -977,7 +1243,8 @@ async def search_users(
 async def get_user_by_id(
     user_id: str,
     current_user: Annotated[UserResponse, Depends(get_current_active_user)],
-    auth_service: Annotated[AuthService, Depends(get_auth_service)],
+    auth_service: Annotated[SQLiteAuthService, Depends(get_sqlite_auth_service)],
+    db: Annotated[AsyncSession, Depends(get_db)],
 ):
     """ID로 사용자 조회
     
@@ -1002,7 +1269,8 @@ async def get_user_by_id(
 
 @app.post("/api/v1/init/admin", response_model=UserResponse)
 async def init_admin(
-    auth_service: Annotated[AuthService, Depends(get_auth_service)],
+    auth_service: Annotated[SQLiteAuthService, Depends(get_sqlite_auth_service)],
+    db: Annotated[AsyncSession, Depends(get_db)],
 ):
     """
     초기 관리자 계정 생성 (개발/테스트 전용)
@@ -1074,7 +1342,8 @@ async def update_user_roles(
     user_id: str,
     roles: list[str],
     current_user: Annotated[UserResponse, Depends(require_admin)],
-    auth_service: Annotated[AuthService, Depends(get_auth_service)],
+    auth_service: Annotated[SQLiteAuthService, Depends(get_sqlite_auth_service)],
+    db: Annotated[AsyncSession, Depends(get_db)],
 ):
     """사용자 역할 업데이트 (관리자 전용)
     
@@ -1127,7 +1396,8 @@ async def update_user_roles(
 @app.get("/api/v1/admin/users", response_model=list[UserResponse])
 async def list_users(
     current_user: Annotated[UserResponse, Depends(require_admin)],
-    auth_service: Annotated[AuthService, Depends(get_auth_service)],
+    auth_service: Annotated[SQLiteAuthService, Depends(get_sqlite_auth_service)],
+    db: Annotated[AsyncSession, Depends(get_db)],
     skip: int = 0,
     limit: int = 50
 ):
@@ -1148,7 +1418,8 @@ async def list_users(
 @app.get("/api/v1/admin/users/stats")
 async def get_user_stats(
     current_user: Annotated[UserResponse, Depends(require_admin)],
-    auth_service: Annotated[AuthService, Depends(get_auth_service)],
+    auth_service: Annotated[SQLiteAuthService, Depends(get_sqlite_auth_service)],
+    db: Annotated[AsyncSession, Depends(get_db)],
 ):
     """사용자 통계 조회 (관리자 전용)"""
     return await auth_service.get_user_statistics()
@@ -1185,6 +1456,650 @@ async def health_check():
         "service": "auth-gateway",
         "version": "1.0.0",
     }
+
+
+# === FastHTML 관리 웹 페이지 ===
+
+def create_layout(title: str, content, current_user=None):
+    """공통 레이아웃 템플릿"""
+    # FastHTML에서는 to_xml()을 직접 호출하지 않고 객체를 반환
+    # FastAPI HTMLResponse와 함께 사용시 자동으로 변환됨
+    return Html(
+        Head(
+            Title(f"{title} - MCP Auth Gateway"),
+            Meta(charset="utf-8"),
+            Meta(name="viewport", content="width=device-width, initial-scale=1"),
+            # Tailwind CSS CDN
+            Link(rel="stylesheet", href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css"),
+            # Alpine.js for interactivity
+            Script(src="https://unpkg.com/alpinejs@3.x.x/dist/cdn.min.js", defer=True)
+        ),
+        Body(
+            # Navigation
+            Nav(
+                Div(
+                    Div(
+                        H1("MCP Auth Gateway", cls="text-xl font-bold text-white"),
+                        cls="container mx-auto px-4 py-3 flex justify-between items-center"
+                    ),
+                    cls="bg-blue-600"
+                ),
+                Div(
+                    Div(
+                        A("대시보드", href="/admin", cls="px-3 py-2 text-sm font-medium text-gray-700 hover:text-blue-600"),
+                        A("사용자 관리", href="/admin/users", cls="px-3 py-2 text-sm font-medium text-gray-700 hover:text-blue-600"),
+                        A("권한 관리", href="/admin/permissions", cls="px-3 py-2 text-sm font-medium text-gray-700 hover:text-blue-600"),
+                        A("역할 관리", href="/admin/roles", cls="px-3 py-2 text-sm font-medium text-gray-700 hover:text-blue-600"),
+                        cls="container mx-auto px-4 flex space-x-4"
+                    ),
+                    cls="bg-gray-100 border-b"
+                )
+            ),
+            # Main content
+            Main(
+                Div(
+                    content,
+                    cls="container mx-auto px-4 py-8"
+                )
+            ),
+            cls="min-h-screen bg-gray-50"
+        )
+    )
+
+
+@app.get("/admin", response_class=HTMLResponse)
+async def admin_dashboard(
+    current_user: Annotated[UserResponse, Depends(require_admin)],
+    auth_service: Annotated[SQLiteAuthService, Depends(get_sqlite_auth_service)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    """관리자 대시보드"""
+    try:
+        # 사용자 통계 조회
+        from .repositories.sqlite_user_repository import SQLiteUserRepository
+        repository = SQLiteUserRepository(db)
+        stats = await repository.get_user_stats()
+        
+        content = Div(
+            H1("관리자 대시보드", cls="text-3xl font-bold text-gray-900 mb-8"),
+            
+            # 통계 카드들
+            Div(
+                # 총 사용자 수
+                Div(
+                    Div(
+                        H3("총 사용자", cls="text-lg font-semibold text-gray-700"),
+                        P(str(stats.get("total_users", 0)), cls="text-3xl font-bold text-blue-600"),
+                        cls="p-6"
+                    ),
+                    cls="bg-white rounded-lg shadow-md"
+                ),
+                
+                # 활성 사용자 수
+                Div(
+                    Div(
+                        H3("활성 사용자", cls="text-lg font-semibold text-gray-700"),
+                        P(str(stats.get("active_users", 0)), cls="text-3xl font-bold text-green-600"),
+                        cls="p-6"
+                    ),
+                    cls="bg-white rounded-lg shadow-md"
+                ),
+                
+                # 관리자 수
+                Div(
+                    Div(
+                        H3("관리자", cls="text-lg font-semibold text-gray-700"),
+                        P(str(stats.get("admin_users", 0)), cls="text-3xl font-bold text-purple-600"),
+                        cls="p-6"
+                    ),
+                    cls="bg-white rounded-lg shadow-md"
+                ),
+                
+                # 오늘 가입
+                Div(
+                    Div(
+                        H3("오늘 가입", cls="text-lg font-semibold text-gray-700"),
+                        P(str(stats.get("today_registrations", 0)), cls="text-3xl font-bold text-orange-600"),
+                        cls="p-6"
+                    ),
+                    cls="bg-white rounded-lg shadow-md"
+                ),
+                
+                cls="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8"
+            ),
+            
+            # 빠른 액션
+            Div(
+                H2("빠른 액션", cls="text-2xl font-bold text-gray-900 mb-4"),
+                Div(
+                    A(
+                        "사용자 관리",
+                        href="/admin/users",
+                        cls="inline-block bg-blue-500 hover:bg-blue-600 text-white font-medium py-2 px-4 rounded-lg mr-4 mb-2"
+                    ),
+                    A(
+                        "권한 설정",
+                        href="/admin/permissions", 
+                        cls="inline-block bg-green-500 hover:bg-green-600 text-white font-medium py-2 px-4 rounded-lg mr-4 mb-2"
+                    ),
+                    A(
+                        "역할 관리",
+                        href="/admin/roles",
+                        cls="inline-block bg-purple-500 hover:bg-purple-600 text-white font-medium py-2 px-4 rounded-lg mr-4 mb-2"
+                    ),
+                    A(
+                        "API 문서",
+                        href="/docs",
+                        cls="inline-block bg-gray-500 hover:bg-gray-600 text-white font-medium py-2 px-4 rounded-lg mr-4 mb-2"
+                    )
+                ),
+                cls="bg-white rounded-lg shadow-md p-6"
+            )
+        )
+        
+        page = create_layout("대시보드", content, current_user)
+        # FastHTML 객체를 HTML 문자열로 변환
+        html_content = to_xml(page)
+        return HTMLResponse(content=html_content)
+        
+    except Exception as e:
+        logger.error("대시보드 로딩 실패", error=str(e))
+        error_content = Div(
+            H1("오류", cls="text-3xl font-bold text-red-600 mb-4"),
+            P(f"대시보드를 로드하는 중 오류가 발생했습니다: {str(e)}", cls="text-gray-700")
+        )
+        page = create_layout("오류", error_content, current_user)
+        html_content = to_xml(page)
+        return HTMLResponse(content=html_content)
+
+
+@app.get("/admin/users", response_class=HTMLResponse)
+async def admin_users_page(
+    current_user: Annotated[UserResponse, Depends(require_admin)],
+    auth_service: Annotated[SQLiteAuthService, Depends(get_sqlite_auth_service)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    """사용자 관리 페이지"""
+    try:
+        # 사용자 목록 조회
+        from .repositories.sqlite_user_repository import SQLiteUserRepository
+        repository = SQLiteUserRepository(db)
+        users = await repository.list_all(skip=0, limit=50)
+        
+        content = Div(
+            H1("사용자 관리", cls="text-3xl font-bold text-gray-900 mb-8"),
+            
+            # 사용자 목록 테이블
+            Div(
+                Table(
+                    Thead(
+                        Tr(
+                            Th("ID", cls="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider"),
+                            Th("이메일", cls="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider"),
+                            Th("사용자명", cls="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider"),
+                            Th("역할", cls="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider"),
+                            Th("상태", cls="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider"),
+                            Th("가입일", cls="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider"),
+                            Th("액션", cls="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider")
+                        )
+                    ),
+                    Tbody(
+                        *[
+                            Tr(
+                                Td(str(user.id), cls="px-6 py-4 whitespace-nowrap text-sm text-gray-900"),
+                                Td(user.email, cls="px-6 py-4 whitespace-nowrap text-sm text-gray-900"),
+                                Td(user.username or "-", cls="px-6 py-4 whitespace-nowrap text-sm text-gray-900"),
+                                Td(
+                                    ", ".join(user.roles),
+                                    cls="px-6 py-4 whitespace-nowrap text-sm text-gray-900"
+                                ),
+                                Td(
+                                    Span(
+                                        "활성" if user.is_active else "비활성",
+                                        cls=f"px-2 inline-flex text-xs leading-5 font-semibold rounded-full {'bg-green-100 text-green-800' if user.is_active else 'bg-red-100 text-red-800'}"
+                                    ),
+                                    cls="px-6 py-4 whitespace-nowrap"
+                                ),
+                                Td(
+                                    user.created_at.strftime("%Y-%m-%d"),
+                                    cls="px-6 py-4 whitespace-nowrap text-sm text-gray-900"
+                                ),
+                                Td(
+                                    Button(
+                                        "권한 보기",
+                                        onclick=f"window.location.href='/admin/users/{user.id}/permissions'",
+                                        cls="text-blue-600 hover:text-blue-900 text-sm font-medium mr-2"
+                                    ),
+                                    Button(
+                                        "역할 변경",
+                                        onclick=f"openRoleModal({user.id}, '{user.email}', {user.roles})",
+                                        cls="text-green-600 hover:text-green-900 text-sm font-medium"
+                                    ),
+                                    cls="px-6 py-4 whitespace-nowrap text-sm font-medium"
+                                )
+                            )
+                            for user in users
+                        ]
+                    ),
+                    cls="min-w-full divide-y divide-gray-200"
+                ),
+                cls="bg-white shadow overflow-hidden sm:rounded-lg"
+            ),
+            
+            # 역할 변경 모달 (Alpine.js)
+            Script("""
+                function openRoleModal(userId, email, currentRoles) {
+                    // TODO: 모달 구현
+                    alert(`사용자 ${email}의 역할 변경 기능은 곧 구현될 예정입니다.`);
+                }
+            """)
+        )
+        
+        page = create_layout("사용자 관리", content, current_user)
+        html_content = to_xml(page)
+        return HTMLResponse(content=html_content)
+        
+    except Exception as e:
+        logger.error("사용자 관리 페이지 로딩 실패", error=str(e))
+        error_content = Div(
+            H1("오류", cls="text-3xl font-bold text-red-600 mb-4"),
+            P(f"사용자 관리 페이지를 로드하는 중 오류가 발생했습니다: {str(e)}", cls="text-gray-700")
+        )
+        page = create_layout("오류", error_content, current_user)
+        html_content = to_xml(page)
+        return HTMLResponse(content=html_content)
+
+
+@app.get("/admin/permissions", response_class=HTMLResponse)
+async def admin_permissions_page(
+    current_user: Annotated[UserResponse, Depends(require_admin)],
+    permission_service: Annotated["PermissionService", Depends(get_permission_service)],
+):
+    """권한 관리 페이지"""
+    try:
+        content = Div(
+            H1("권한 관리", cls="text-3xl font-bold text-gray-900 mb-8"),
+            
+            # 권한 생성 폼
+            Div(
+                H2("새 권한 추가", cls="text-xl font-semibold text-gray-900 mb-4"),
+                Form(
+                    Div(
+                        Div(
+                            Label("대상 타입", cls="block text-sm font-medium text-gray-700 mb-2"),
+                            Select(
+                                Option("사용자별", value="user"),
+                                Option("역할별", value="role"),
+                                name="target_type",
+                                cls="block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
+                            ),
+                            cls="mb-4"
+                        ),
+                        Div(
+                            Label("리소스 타입", cls="block text-sm font-medium text-gray-700 mb-2"),
+                            Select(
+                                Option("웹 검색", value="web_search"),
+                                Option("벡터 DB", value="vector_db"),
+                                Option("데이터베이스", value="database"),
+                                name="resource_type",
+                                cls="block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
+                            ),
+                            cls="mb-4"
+                        ),
+                        cls="grid grid-cols-1 md:grid-cols-2 gap-4"
+                    ),
+                    Div(
+                        Label("리소스 이름", cls="block text-sm font-medium text-gray-700 mb-2"),
+                        Input(
+                            type="text",
+                            name="resource_name",
+                            placeholder="예: public.*, users.documents",
+                            cls="block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
+                        ),
+                        cls="mb-4"
+                    ),
+                    Div(
+                        Label("권한", cls="block text-sm font-medium text-gray-700 mb-2"),
+                        Div(
+                            Label(
+                                Input(type="checkbox", name="actions", value="read", cls="mr-2"),
+                                "읽기",
+                                cls="inline-flex items-center mr-4"
+                            ),
+                            Label(
+                                Input(type="checkbox", name="actions", value="write", cls="mr-2"),
+                                "쓰기",
+                                cls="inline-flex items-center mr-4"
+                            ),
+                            Label(
+                                Input(type="checkbox", name="actions", value="delete", cls="mr-2"),
+                                "삭제",
+                                cls="inline-flex items-center"
+                            ),
+                            cls="flex flex-wrap"
+                        ),
+                        cls="mb-4"
+                    ),
+                    Button(
+                        "권한 추가",
+                        type="submit",
+                        cls="bg-blue-500 hover:bg-blue-600 text-white font-medium py-2 px-4 rounded-lg"
+                    ),
+                    method="post",
+                    action="/admin/permissions/create",
+                    cls="space-y-4"
+                ),
+                cls="bg-white rounded-lg shadow-md p-6 mb-8"
+            ),
+            
+            # 기존 권한 목록
+            Div(
+                H2("기존 권한 목록", cls="text-xl font-semibold text-gray-900 mb-4"),
+                P("권한 목록을 보려면 API를 통해 조회하세요.", cls="text-gray-600"),
+                A(
+                    "권한 API 보기",
+                    href="/docs#/default/list_resource_permissions_api_v1_permissions_resources_get",
+                    cls="inline-block bg-gray-500 hover:bg-gray-600 text-white font-medium py-2 px-4 rounded-lg mt-4"
+                ),
+                cls="bg-white rounded-lg shadow-md p-6"
+            )
+        )
+        
+        page = create_layout("권한 관리", content, current_user)
+        html_content = to_xml(page)
+        return HTMLResponse(content=html_content)
+        
+    except Exception as e:
+        logger.error("권한 관리 페이지 로딩 실패", error=str(e))
+        error_content = Div(
+            H1("오류", cls="text-3xl font-bold text-red-600 mb-4"),
+            P(f"권한 관리 페이지를 로드하는 중 오류가 발생했습니다: {str(e)}", cls="text-gray-700")
+        )
+        page = create_layout("오류", error_content, current_user)
+        html_content = to_xml(page)
+        return HTMLResponse(content=html_content)
+
+
+@app.get("/admin/roles", response_class=HTMLResponse)
+async def admin_roles_page(
+    current_user: Annotated[UserResponse, Depends(require_admin)],
+    rbac_service: Annotated["RBACService", Depends(get_rbac_service)],
+):
+    """역할 관리 페이지"""
+    try:
+        # 역할 목록 조회
+        roles = []
+        for role_name, permissions in rbac_service.role_permissions.items():
+            roles.append({
+                "name": role_name,
+                "permissions": permissions,
+                "permission_count": len(permissions)
+            })
+        
+        content = Div(
+            H1("역할 관리", cls="text-3xl font-bold text-gray-900 mb-8"),
+            
+            # 역할 생성 폼
+            Div(
+                H2("새 역할 추가", cls="text-xl font-semibold text-gray-900 mb-4"),
+                Form(
+                    Div(
+                        Label("역할 이름", cls="block text-sm font-medium text-gray-700 mb-2"),
+                        Input(
+                            type="text",
+                            name="name",
+                            placeholder="예: editor, viewer",
+                            cls="block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
+                        ),
+                        cls="mb-4"
+                    ),
+                    Div(
+                        Label("설명 (선택사항)", cls="block text-sm font-medium text-gray-700 mb-2"),
+                        Textarea(
+                            name="description",
+                            placeholder="역할에 대한 설명을 입력하세요",
+                            rows="3",
+                            cls="block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
+                        ),
+                        cls="mb-4"
+                    ),
+                    Button(
+                        "역할 생성",
+                        type="submit",
+                        cls="bg-green-500 hover:bg-green-600 text-white font-medium py-2 px-4 rounded-lg"
+                    ),
+                    method="post",
+                    action="/admin/roles/create",
+                    cls="space-y-4"
+                ),
+                cls="bg-white rounded-lg shadow-md p-6 mb-8"
+            ),
+            
+            # 기존 역할 목록
+            Div(
+                H2("기존 역할 목록", cls="text-xl font-semibold text-gray-900 mb-4"),
+                Div(
+                    P(f"총 {len(roles)}개의 역할이 있습니다.", cls="text-gray-600"),
+                    cls="bg-white rounded-lg shadow-md p-6"
+                )
+            ),
+            
+            # JavaScript 함수들
+            Script("""
+                function editRole(roleName) {
+                    alert(`역할 '${roleName}' 수정 기능은 곧 구현될 예정입니다.`);
+                }
+                
+                function deleteRole(roleName) {
+                    if (confirm(`정말로 역할 '${roleName}'을 삭제하시겠습니까?`)) {
+                        fetch(`/api/v1/roles/${roleName}`, {
+                            method: 'DELETE',
+                            headers: {
+                                'Authorization': 'Bearer ' + localStorage.getItem('access_token')
+                            }
+                        })
+                        .then(response => response.json())
+                        .then(data => {
+                            alert('역할이 삭제되었습니다.');
+                            location.reload();
+                        })
+                        .catch(error => {
+                            alert('역할 삭제 중 오류가 발생했습니다.');
+                        });
+                    }
+                }
+            """)
+        )
+        
+        page = create_layout("역할 관리", content, current_user)
+        html_content = to_xml(page)
+        return HTMLResponse(content=html_content)
+        
+    except Exception as e:
+        logger.error("역할 관리 페이지 로딩 실패", error=str(e))
+        error_content = Div(
+            H1("오류", cls="text-3xl font-bold text-red-600 mb-4"),
+            P(f"역할 관리 페이지를 로드하는 중 오류가 발생했습니다: {str(e)}", cls="text-gray-700")
+        )
+        page = create_layout("오류", error_content, current_user)
+        html_content = to_xml(page)
+        return HTMLResponse(content=html_content)
+
+
+@app.get("/admin/users/{user_id}/permissions", response_class=HTMLResponse)
+async def admin_user_permissions_page(
+    user_id: int,
+    current_user: Annotated[UserResponse, Depends(require_admin)],
+    auth_service: Annotated[SQLiteAuthService, Depends(get_sqlite_auth_service)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    permission_service: Annotated["PermissionService", Depends(get_permission_service)],
+):
+    """사용자별 권한 관리 페이지"""
+    try:
+        # 사용자 정보 조회
+        user = await auth_service.get_user_by_id(str(user_id))
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="사용자를 찾을 수 없습니다"
+            )
+        
+        # 사용자 권한 조회 (API 호출 시뮬레이션)
+        permissions = []
+        if permission_service.db_conn:
+            try:
+                query = """
+                    SELECT id, resource_type, resource_name, actions, granted_at
+                    FROM resource_permissions
+                    WHERE user_id = $1
+                    ORDER BY granted_at DESC
+                """
+                rows = await permission_service.db_conn.fetch(query, user_id)
+                permissions = [
+                    {
+                        "id": row["id"],
+                        "resource_type": row["resource_type"],
+                        "resource_name": row["resource_name"],
+                        "actions": row["actions"],
+                        "granted_at": row["granted_at"]
+                    }
+                    for row in rows
+                ]
+            except Exception as e:
+                logger.warning("사용자 권한 조회 실패", error=str(e))
+        
+        content = Div(
+            Div(
+                A("← 사용자 관리로 돌아가기", href="/admin/users", cls="text-blue-600 hover:text-blue-800 mb-4 inline-block"),
+                cls="mb-4"
+            ),
+            
+            H1(f"{user.email}의 권한 관리", cls="text-3xl font-bold text-gray-900 mb-8"),
+            
+            # 사용자 정보
+            Div(
+                H2("사용자 정보", cls="text-xl font-semibold text-gray-900 mb-4"),
+                Div(
+                    P(f"이메일: {user.email}", cls="mb-2"),
+                    P(f"사용자명: {user.username or '-'}", cls="mb-2"),
+                    P(f"역할: {', '.join(user.roles)}", cls="mb-2"),
+                    P(f"상태: {'활성' if user.is_active else '비활성'}", cls="mb-2"),
+                    P(f"가입일: {user.created_at.strftime('%Y-%m-%d')}", cls="mb-2"),
+                    cls="text-gray-700"
+                ),
+                cls="bg-white rounded-lg shadow-md p-6 mb-8"
+            ),
+            
+            # 개별 권한 목록  
+            Div(
+                H2("개별 권한", cls="text-xl font-semibold text-gray-900 mb-4"),
+                Div(
+                    P(f"총 {len(permissions) if permissions else 0}개의 개별 권한이 있습니다." if permissions else "이 사용자에게 부여된 개별 권한이 없습니다.", cls="text-gray-600 text-center py-8"),
+                    cls="bg-white rounded-lg shadow-md"
+                )
+            ),
+            
+            # 권한 추가 폼
+            Div(
+                H2("새 권한 추가", cls="text-xl font-semibold text-gray-900 mb-4"),
+                Form(
+                    Input(type="hidden", name="user_id", value=str(user_id)),
+                    Div(
+                        Div(
+                            Label("리소스 타입", cls="block text-sm font-medium text-gray-700 mb-2"),
+                            Select(
+                                Option("웹 검색", value="web_search"),
+                                Option("벡터 DB", value="vector_db"),
+                                Option("데이터베이스", value="database"),
+                                name="resource_type",
+                                cls="block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
+                            ),
+                            cls="mb-4"
+                        ),
+                        Div(
+                            Label("리소스 이름", cls="block text-sm font-medium text-gray-700 mb-2"),
+                            Input(
+                                type="text",
+                                name="resource_name",
+                                placeholder="예: public.*, users.documents",
+                                cls="block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500"
+                            ),
+                            cls="mb-4"
+                        ),
+                        cls="grid grid-cols-1 md:grid-cols-2 gap-4"
+                    ),
+                    Div(
+                        Label("권한", cls="block text-sm font-medium text-gray-700 mb-2"),
+                        Div(
+                            Label(
+                                Input(type="checkbox", name="actions", value="read", cls="mr-2"),
+                                "읽기",
+                                cls="inline-flex items-center mr-4"
+                            ),
+                            Label(
+                                Input(type="checkbox", name="actions", value="write", cls="mr-2"),
+                                "쓰기",
+                                cls="inline-flex items-center mr-4"
+                            ),
+                            Label(
+                                Input(type="checkbox", name="actions", value="delete", cls="mr-2"),
+                                "삭제",
+                                cls="inline-flex items-center"
+                            ),
+                            cls="flex flex-wrap"
+                        ),
+                        cls="mb-4"
+                    ),
+                    Button(
+                        "권한 추가",
+                        type="submit",
+                        cls="bg-blue-500 hover:bg-blue-600 text-white font-medium py-2 px-4 rounded-lg"
+                    ),
+                    method="post",
+                    action=f"/admin/users/{user_id}/permissions/create",
+                    cls="space-y-4"
+                ),
+                cls="bg-white rounded-lg shadow-md p-6"
+            ),
+            
+            # JavaScript 함수들
+            Script("""
+                function deletePermission(permissionId) {
+                    if (confirm('정말로 이 권한을 삭제하시겠습니까?')) {
+                        fetch(`/api/v1/permissions/resources/${permissionId}`, {
+                            method: 'DELETE',
+                            headers: {
+                                'Authorization': 'Bearer ' + localStorage.getItem('access_token')
+                            }
+                        })
+                        .then(response => response.json())
+                        .then(data => {
+                            alert('권한이 삭제되었습니다.');
+                            location.reload();
+                        })
+                        .catch(error => {
+                            alert('권한 삭제 중 오류가 발생했습니다.');
+                        });
+                    }
+                }
+            """)
+        )
+        
+        page = create_layout(f"{user.email} 권한 관리", content, current_user)
+        html_content = to_xml(page)
+        return HTMLResponse(content=html_content)
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("사용자 권한 페이지 로딩 실패", error=str(e))
+        error_content = Div(
+            H1("오류", cls="text-3xl font-bold text-red-600 mb-4"),
+            P(f"사용자 권한 페이지를 로드하는 중 오류가 발생했습니다: {str(e)}", cls="text-gray-700")
+        )
+        page = create_layout("오류", error_content, current_user)
+        html_content = to_xml(page)
+        return HTMLResponse(content=html_content)
 
 
 # === 에러 핸들러 ===

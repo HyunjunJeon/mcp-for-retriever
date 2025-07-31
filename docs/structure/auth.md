@@ -12,13 +12,12 @@ graph TD
     auth --> server[server.py<br/>FastAPI 서버]
     auth --> services[services/<br/>비즈니스 로직]
     auth --> repositories[repositories/<br/>데이터 접근]
-    auth --> client[client.py<br/>클라이언트]
+    auth --> dependencies[dependencies.py<br/>의존성 주입]
     
     services --> auth_service[auth_service.py<br/>인증 로직]
     services --> jwt_service[jwt_service.py<br/>JWT 관리]
     services --> rbac_service[rbac_service.py<br/>권한 관리]
-    services --> mcp_proxy[mcp_proxy.py<br/>MCP 프록시]
-    services --> user_service[user_service.py<br/>사용자 관리]
+    services --> permission_service[permission_service.py<br/>세밀한 권한]
     
     repositories --> user_repo[user_repository.py<br/>사용자 저장소]
 ```

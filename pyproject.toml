@@ -33,6 +33,7 @@ dependencies = [
     "opentelemetry-exporter-otlp>=1.29.0",
     "opentelemetry-exporter-prometheus>=0.50b0",
     "sentry-sdk[fastapi]>=2.19.0",
+    "python-fasthtml>=0.12.22",
 ]
 
 [dependency-groups]

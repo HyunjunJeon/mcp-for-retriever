@@ -38,6 +38,11 @@ from datetime import datetime, timezone
 
 from fastmcp import FastMCP, Context
 from fastmcp.exceptions import ToolError
+# FastMCP auth imports
+# from fastmcp.server.auth import BearerAuthProvider  # OAuth 2.0용이므로 커스텀 JWT에는 부적합
+from fastmcp.server.dependencies import get_access_token
+from fastmcp.server.auth.providers.bearer import AccessToken
+from fastapi import Depends
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
@@ -50,13 +55,18 @@ from src.retrievers.base import Retriever, RetrieverConfig, QueryError
 
 # 미들웨어 임포트
 from src.middleware import (
-    AuthMiddleware,
     LoggingMiddleware,
     RateLimitMiddleware,
     ValidationMiddleware,
     MetricsMiddleware,
     ErrorHandlerMiddleware
 )
+# from src.middleware.jwt_auth import JWTAuthMiddleware  # FastMCP BearerAuthProvider로 대체됨
+
+# 인증 서비스 임포트
+from src.auth.services.jwt_service import JWTService
+from src.auth.services.rbac_service import RBACService
+from src.auth.verifiers import JWTBearerVerifier
 
 # 캐시 관련 임포트
 
@@ -123,8 +133,15 @@ class UnifiedMCPServer:
         self.context_store: Optional[Dict[str, UserContext]] = None
         
         # 미들웨어 인스턴스 저장 (라이프사이클 관리용)
-        self.auth_middleware: Optional[AuthMiddleware] = None
         self.metrics_middleware: Optional[MetricsMiddleware] = None
+        self.jwt_auth_middleware = None  # Removed - using FastMCP BearerAuthProvider instead
+        
+        # Bearer 인증 검증기 (현재 미사용)
+        self.bearer_verifier: Optional[JWTBearerVerifier] = None
+        
+        # 인증 서비스 인스턴스
+        self.jwt_service: Optional[JWTService] = None
+        self.rbac_service: Optional[RBACService] = None
         
         # 설정 검증 (Docker 배포용 임시 우회)
         # is_valid, errors = validate_config(config)
@@ -165,15 +182,34 @@ class UnifiedMCPServer:
             )
             logger.debug("에러 핸들러 미들웨어 초기화")
         
-        # 2. 인증
+        # 2. 인증 서비스 초기화
         if self.config.features["auth"] and self.config.auth_config:
-            self.auth_middleware = AuthMiddleware(
-                internal_api_key=self.config.auth_config.internal_api_key,
-                auth_gateway_url=self.config.auth_config.auth_gateway_url,
+            # JWT 서비스 초기화
+            if not self.config.auth_config.jwt_secret_key:
+                logger.error("JWT_SECRET_KEY가 설정되지 않았습니다")
+                raise ValueError("JWT_SECRET_KEY는 필수 설정입니다")
+            
+            self.jwt_service = JWTService(
+                secret_key=self.config.auth_config.jwt_secret_key,
+                algorithm=self.config.auth_config.jwt_algorithm,
+                access_token_expire_minutes=self.config.auth_config.jwt_access_token_expire_minutes,
+                refresh_token_expire_minutes=self.config.auth_config.jwt_refresh_token_expire_days * 24 * 60
+            )
+            
+            # RBAC 서비스 초기화
+            self.rbac_service = RBACService()
+            
+            # JWTBearerVerifier 인스턴스 생성 (FastMCP 표준 방식)
+            self.bearer_verifier = JWTBearerVerifier(
+                jwt_service=self.jwt_service,
+                internal_api_key=self.config.auth_config.internal_api_key or "",
                 require_auth=self.config.auth_config.require_auth
             )
-            self.middlewares.append(self.auth_middleware)
-            logger.debug("인증 미들웨어 초기화")
+            
+            # JWT 인증 미들웨어는 FastMCP BearerAuthProvider로 대체됨
+            self.jwt_auth_middleware = None  # 더 이상 사용하지 않음
+            
+            logger.debug("JWT 서비스 및 BearerVerifier 초기화 완료 (미들웨어는 FastMCP 표준으로 대체)")
         
         # 3. 로깅
         if self.config.features["enhanced_logging"] and self.config.logging_config:
@@ -314,10 +350,7 @@ class UnifiedMCPServer:
         """종료 시 정리 작업"""
         logger.info("통합 MCP 서버 종료 중...")
         
-        # 미들웨어 정리
-        if self.auth_middleware:
-            await self.auth_middleware.close()
-            logger.debug("인증 미들웨어 정리 완료")
+        # 미들웨어 정리 (필요한 경우)
         
         # 메트릭 최종 로깅
         if self.metrics_middleware:
@@ -371,11 +404,18 @@ class UnifiedMCPServer:
                 await self.cleanup()
         
         # FastMCP 서버 생성
-        server = FastMCP(
-            name=self.config.name,
-            lifespan=lifespan,
-            instructions=self._build_instructions()
-        )
+        server_kwargs = {
+            "name": self.config.name,
+            "lifespan": lifespan,
+            "instructions": self._build_instructions()
+        }
+        
+        # 인증 설정 - 도구 함수 레벨에서 AccessToken 의존성 주입 방식 사용
+        # BearerAuthProvider는 OAuth 2.0 표준용이므로 커스텀 JWT 검증에는 적합하지 않음
+        if self.config.features["auth"] and self.bearer_verifier:
+            logger.info("FastMCP 커스텀 JWT 인증 활성화 - 도구 함수 레벨 AccessToken 의존성 주입")
+        
+        server = FastMCP(**server_kwargs)
         
         # 미들웨어 적용
         for middleware in self.middlewares:
@@ -452,35 +492,19 @@ class UnifiedMCPServer:
             # context에서 request 가져오기
             request = context.request if hasattr(context, 'request') else {}
             
-            # 인증 정보 처리
+            # 인증 정보 처리 (JWT 미들웨어에서 이미 처리됨)
             if self.config.features["auth"]:
-                headers = request.get("headers", {})
-                auth_header = headers.get("authorization", "")
-                
-                if self.config.auth_config and auth_header:
-                    # 사용자 정보 획득 시도
-                    if auth_header != f"Bearer {self.config.auth_config.internal_api_key}":
-                        try:
-                            async with httpx.AsyncClient() as client:
-                                response = await client.get(
-                                    f"{self.config.auth_config.auth_gateway_url}/auth/me",
-                                    headers={"Authorization": auth_header},
-                                )
-                                if response.status_code == 200:
-                                    user_info = response.json()
-                                    user_context.set_user(user_info)
-                                    if isinstance(request, dict):
-                                        request["user"] = user_info
-                                        request["user_context"] = user_context
-                        except Exception as e:
-                            logger.error("사용자 정보 획득 실패", error=str(e))
-                    else:
-                        # 서비스 간 호출
-                        user_info = {"type": "service", "service": "internal"}
-                        user_context.set_user(user_info)
-                        if isinstance(request, dict):
-                            request["user"] = user_info
-                            request["user_context"] = user_context
+                # JWT 미들웨어에서 설정한 사용자 정보를 컨텍스트에 복사
+                if hasattr(context, 'user_info') and context.user_info:
+                    user_info = context.user_info
+                    user_context.set_user({
+                        "id": user_info.get("user_id"),
+                        "email": user_info.get("email"),
+                        "type": user_info.get("type")
+                    })
+                    if isinstance(request, dict):
+                        request["user"] = user_info
+                        request["user_context"] = user_context
             
             # 요청 로깅
             method = request.get("method") if isinstance(request, dict) else None
@@ -533,12 +557,14 @@ class UnifiedMCPServer:
             limit: int = 10,
             include_domains: Optional[List[str]] = None,
             exclude_domains: Optional[List[str]] = None,
-            use_cache: bool = True
+            use_cache: bool = True,
+            access_token: Optional[AccessToken] = Depends(get_access_token)
         ) -> List[Dict[str, Any]]:
             """
             Tavily를 사용한 웹 검색
             
             Args:
+                access_token: 사용자 인증 토큰 (FastMCP 자동 주입)
                 query: 검색 쿼리 문자열
                 limit: 최대 결과 수 (기본값: 10)
                 include_domains: 검색에 포함할 도메인 목록
@@ -548,14 +574,39 @@ class UnifiedMCPServer:
             Returns:
                 검색 결과 목록
             """
+            start_time = datetime.now(timezone.utc)
+            tool_name = "search_web"
+            
+            # 사용자 컨텍스트 관리
+            user_context = await self._get_or_create_user_context(ctx, access_token)
+            
+            # 사용자 정보 추출
+            user_id, user_email, user_type = self._get_user_info_from_token(access_token)
+
+            logger.info(
+                "웹 검색 요청 시작",
+                extra={
+                    "query": query,
+                    "limit": limit,
+                    "include_domains": include_domains,
+                    "exclude_domains": exclude_domains,
+                    "use_cache": use_cache,
+                    "user_id": user_id,
+                    "user_email": user_email,
+                    "user_type": user_type
+                }
+            )
+            
             emoji = "🔍" if use_emoji else ""
-            await ctx.info(f"{emoji} 웹 검색 시작: {query[:50]}...")
+            await ctx.info(f"{emoji} 웹 검색 시작 (사용자: {user_id}): {query[:50]}...")
             
             if "tavily" not in self.retrievers:
+                await self._record_tool_usage(ctx, tool_name, start_time, False, "Tavily retriever not available")
                 raise ToolError("웹 검색을 사용할 수 없습니다")
             
             retriever = self.retrievers["tavily"]
             if not retriever.connected:
+                await self._record_tool_usage(ctx, tool_name, start_time, False, "Tavily retriever not connected")
                 raise ToolError("웹 검색을 사용할 수 없습니다 - 연결되지 않음")
             
             # 캐싱이 활성화된 경우 캐시 제어
@@ -575,12 +626,37 @@ class UnifiedMCPServer:
                 async for result in retriever.retrieve(query, limit=limit, **search_params):
                     results.append(result)
                 
+                logger.info(
+                    "웹 검색 완료",
+                    extra={
+                        "results_count": len(results),
+                        "user_id": user_id,
+                        "user_type": user_type
+                    }
+                )
+
                 emoji = "✅" if use_emoji else ""
                 await ctx.info(f"{emoji} 웹 검색 완료: {len(results)}개 결과")
+                
+                # 성공적인 도구 사용 기록
+                await self._record_tool_usage(ctx, tool_name, start_time, True)
+                
                 return results
             except Exception as e:
+                logger.error(
+                    "웹 검색 실패",
+                    extra={
+                        "error": str(e),
+                        "user_id": user_id,
+                        "user_type": user_type
+                    }
+                )
                 emoji = "❌" if use_emoji else ""
                 await ctx.error(f"{emoji} 웹 검색 실패: {str(e)}")
+                
+                # 실패한 도구 사용 기록
+                await self._record_tool_usage(ctx, tool_name, start_time, False, str(e))
+                
                 raise ToolError(f"웹 검색 실패: {str(e)}")
             finally:
                 # 캐시 설정 복원
@@ -594,7 +670,8 @@ class UnifiedMCPServer:
             collection: str,
             limit: int = 10,
             score_threshold: float = 0.7,
-            use_cache: bool = True
+            use_cache: bool = True,
+            access_token: Optional[AccessToken] = Depends(get_access_token)
         ) -> List[Dict[str, Any]]:
             """
             Qdrant를 사용한 벡터 데이터베이스 검색
@@ -609,14 +686,39 @@ class UnifiedMCPServer:
             Returns:
                 유사도 점수가 포함된 검색 결과
             """
+            start_time = datetime.now(timezone.utc)
+            tool_name = "search_vectors"
+            
+            # 사용자 컨텍스트 관리
+            user_context = await self._get_or_create_user_context(ctx, access_token)
+            
+            # 사용자 정보 추출
+            user_id, user_email, user_type = self._get_user_info_from_token(access_token)
+
+            logger.info(
+                "벡터 검색 요청 시작",
+                extra={
+                    "query": query,
+                    "collection": collection,
+                    "limit": limit,
+                    "score_threshold": score_threshold,
+                    "use_cache": use_cache,
+                    "user_id": user_id,
+                    "user_email": user_email,
+                    "user_type": user_type
+                }
+            )
+
             emoji = "🔍" if use_emoji else ""
             await ctx.info(f"{emoji} '{collection}' 컬렉션에서 벡터 검색 중...")
             
             if "qdrant" not in self.retrievers:
+                await self._record_tool_usage(ctx, tool_name, start_time, False, "Qdrant retriever not available")
                 raise ToolError("벡터 검색을 사용할 수 없습니다")
             
             retriever = self.retrievers["qdrant"]
             if not retriever.connected:
+                await self._record_tool_usage(ctx, tool_name, start_time, False, "Qdrant retriever not connected")
                 raise ToolError("벡터 검색을 사용할 수 없습니다 - 연결되지 않음")
             
             # 캐싱이 활성화된 경우 캐시 제어
@@ -632,12 +734,37 @@ class UnifiedMCPServer:
                 ):
                     results.append(result)
                 
+                logger.info(
+                    "벡터 검색 완료",
+                    extra={
+                        "results_count": len(results),
+                        "user_id": user_id,
+                        "user_type": user_type
+                    }
+                )
+
                 emoji = "✅" if use_emoji else ""
                 await ctx.info(f"{emoji} 벡터 검색 완료: {len(results)}개 결과")
+                
+                # 성공적인 도구 사용 기록
+                await self._record_tool_usage(ctx, tool_name, start_time, True)
+                
                 return results
             except QueryError as e:
+                logger.error(
+                    "벡터 검색 실패",
+                    extra={
+                        "error": str(e),
+                        "user_id": user_id,
+                        "user_type": user_type
+                    }
+                )
                 emoji = "❌" if use_emoji else ""
                 await ctx.error(f"{emoji} 벡터 검색 실패: {str(e)}")
+                
+                # 실패한 도구 사용 기록
+                await self._record_tool_usage(ctx, tool_name, start_time, False, str(e))
+                
                 raise ToolError(str(e))
             finally:
                 # 캐시 설정 복원
@@ -748,7 +875,7 @@ class UnifiedMCPServer:
                     import uuid
                     try:
                         # UUID 형식 검증
-                        uuid.UUID(doc_id)
+                        uuid.UUID(str(doc_id))
                     except ValueError:
                         # UUID도 아니면 새로운 UUID 생성
                         doc_id = str(uuid.uuid4())
@@ -947,35 +1074,27 @@ class UnifiedMCPServer:
                 raise ToolError(f"허용되지 않은 테이블: {table}. 허용된 테이블: {', '.join(allowed_tables)}")
             
             try:
-                # SQL 인젝션 방지를 위한 prepared statement 사용
-                columns = list(data.keys())
-                values = list(data.values())
-                placeholders = [f"${i+1}" for i in range(len(values))]
+                # 안전한 SQL 쿼리 생성
+                query, values = await retriever.compose_insert_query(table, data, returning="*")
                 
-                # 테이블명은 화이트리스트로 이미 검증됨
-                query = f"""
-                    INSERT INTO {table} ({', '.join(columns)})
-                    VALUES ({', '.join(placeholders)})
-                    RETURNING *
-                """
+                # retriever의 execute_returning 메서드 사용
+                result = await retriever.execute_returning(query, *values)
                 
-                # 연결 풀에서 연결 가져오기
-                async with retriever._pool.acquire() as connection:
-                    # prepared statement로 실행
-                    result = await connection.fetchrow(query, *values)
+                if result:
+                    emoji = "✅" if use_emoji else ""
+                    await ctx.info(f"{emoji} 레코드 생성 완료")
+                    return {
+                        "status": "success",
+                        "table": table,
+                        "record": result
+                    }
+                else:
+                    raise ToolError("레코드 생성에 실패했습니다")
                     
-                    if result:
-                        record = dict(result)
-                        emoji = "✅" if use_emoji else ""
-                        await ctx.info(f"{emoji} 레코드 생성 완료")
-                        return {
-                            "status": "success",
-                            "table": table,
-                            "record": record
-                        }
-                    else:
-                        raise ToolError("레코드 생성에 실패했습니다")
-                        
+            except QueryError as e:
+                emoji = "❌" if use_emoji else ""
+                await ctx.error(f"{emoji} 레코드 생성 실패: {str(e)}")
+                raise ToolError(f"레코드 생성 실패: {str(e)}")
             except Exception as e:
                 emoji = "❌" if use_emoji else ""
                 await ctx.error(f"{emoji} 레코드 생성 실패: {str(e)}")
@@ -1021,51 +1140,50 @@ class UnifiedMCPServer:
                 raise ToolError(f"허용되지 않은 테이블: {table}")
             
             try:
-                # SET 절 구성
-                set_clauses = []
-                values = []
-                for i, (col, val) in enumerate(data.items()):
-                    set_clauses.append(f"{col} = ${i+1}")
-                    values.append(val)
+                # ID를 정수로 변환
+                record_id_int = int(record_id)
                 
-                # ID는 정수로 변환 후 마지막 파라미터로 추가
-                record_id_int = int(record_id)  # 문자열을 정수로 변환
-                values.append(record_id_int)
+                # 안전한 UPDATE 쿼리 생성
+                query, values = await retriever.compose_update_query(
+                    table=table,
+                    data=data,
+                    where_clause="id = $1",
+                    where_values=[record_id_int],
+                    returning="*"
+                )
                 
-                query = f"""
-                    UPDATE {table}
-                    SET {', '.join(set_clauses)}
-                    WHERE id = ${len(values)}
-                    RETURNING *
-                """
-                
-                async with retriever._pool.acquire() as connection:
-                    # 트랜잭션 사용
-                    async with connection.transaction():
-                        # 먼저 레코드 존재 확인
-                        check_query = f"SELECT id FROM {table} WHERE id = $1"
-                        exists = await connection.fetchval(check_query, record_id_int)
+                # retriever의 transaction 컨텍스트 사용
+                async with retriever.transaction() as conn:
+                    # 먼저 레코드 존재 확인 - 안전한 방식으로 쿼리
+                    # connection의 quote_ident 사용
+                    quoted_table = conn._protocol.get_settings().quote_ident(table)
+                    check_query = f"SELECT id FROM {quoted_table} WHERE id = $1"
+                    exists = await conn.fetchval(check_query, record_id_int)
+                    
+                    if not exists:
+                        emoji = "⚠️" if use_emoji else ""
+                        await ctx.warning(f"{emoji} 레코드를 찾을 수 없음: {record_id}")
+                        raise ToolError(f"레코드를 찾을 수 없습니다: {record_id}")
+                    
+                    # 업데이트 실행
+                    result = await conn.fetchrow(query, *values)
+                    
+                    if result:
+                        record = dict(result)
+                        emoji = "✅" if use_emoji else ""
+                        await ctx.info(f"{emoji} 레코드 수정 완료")
+                        return {
+                            "status": "success",
+                            "table": table,
+                            "record": record
+                        }
+                    else:
+                        raise ToolError("레코드 수정에 실패했습니다")
                         
-                        if not exists:
-                            emoji = "⚠️" if use_emoji else ""
-                            await ctx.warning(f"{emoji} 레코드를 찾을 수 없음: {record_id}")
-                            raise ToolError(f"레코드를 찾을 수 없습니다: {record_id}")
-                        
-                        # 업데이트 실행 (values에 이미 모든 파라미터 포함)
-                        result = await connection.fetchrow(query, *values)
-                        
-                        if result:
-                            record = dict(result)
-                            emoji = "✅" if use_emoji else ""
-                            await ctx.info(f"{emoji} 레코드 수정 완료")
-                            return {
-                                "status": "success",
-                                "table": table,
-                                "record": record
-                            }
-                        else:
-                            raise ToolError("레코드 수정에 실패했습니다")
-                            
+            except QueryError as e:
+                emoji = "❌" if use_emoji else ""
+                await ctx.error(f"{emoji} 레코드 수정 실패: {str(e)}")
+                raise ToolError(f"레코드 수정 실패: {str(e)}")
             except Exception as e:
                 emoji = "❌" if use_emoji else ""
                 await ctx.error(f"{emoji} 레코드 수정 실패: {str(e)}")
@@ -1109,33 +1227,38 @@ class UnifiedMCPServer:
                 raise ToolError(f"허용되지 않은 테이블: {table}")
             
             try:
-                query = f"""
-                    DELETE FROM {table}
-                    WHERE id = $1
-                    RETURNING id
-                """
+                # ID를 정수로 변환
+                record_id_int = int(record_id)
                 
-                async with retriever._pool.acquire() as connection:
-                    # 트랜잭션 사용
-                    async with connection.transaction():
-                        # 삭제 실행
-                        record_id_int = int(record_id)  # 문자열을 정수로 변환
-                        deleted_id = await connection.fetchval(query, record_id_int)
-                        
-                        if deleted_id:
-                            emoji = "✅" if use_emoji else ""
-                            await ctx.info(f"{emoji} 레코드 삭제 완료")
-                            return {
-                                "status": "success",
-                                "table": table,
-                                "record_id": record_id,
-                                "action": "deleted"
-                            }
-                        else:
-                            emoji = "⚠️" if use_emoji else ""
-                            await ctx.warning(f"{emoji} 삭제할 레코드를 찾을 수 없음: {record_id}")
-                            raise ToolError(f"삭제할 레코드를 찾을 수 없습니다: {record_id}")
-                            
+                # 안전한 DELETE 쿼리 생성
+                query, values = await retriever.compose_delete_query(
+                    table=table,
+                    where_clause="id = $1",
+                    where_values=[record_id_int],
+                    returning="id"
+                )
+                
+                # retriever의 execute_returning_scalar 메서드 사용
+                deleted_id = await retriever.execute_returning_scalar(query, *values)
+                
+                if deleted_id:
+                    emoji = "✅" if use_emoji else ""
+                    await ctx.info(f"{emoji} 레코드 삭제 완료")
+                    return {
+                        "status": "success",
+                        "table": table,
+                        "record_id": record_id,
+                        "action": "deleted"
+                    }
+                else:
+                    emoji = "⚠️" if use_emoji else ""
+                    await ctx.warning(f"{emoji} 삭제할 레코드를 찾을 수 없음: {record_id}")
+                    raise ToolError(f"삭제할 레코드를 찾을 수 없습니다: {record_id}")
+                    
+            except QueryError as e:
+                emoji = "❌" if use_emoji else ""
+                await ctx.error(f"{emoji} 레코드 삭제 실패: {str(e)}")
+                raise ToolError(f"레코드 삭제 실패: {str(e)}")
             except Exception as e:
                 emoji = "❌" if use_emoji else ""
                 await ctx.error(f"{emoji} 레코드 삭제 실패: {str(e)}")
@@ -1147,7 +1270,8 @@ class UnifiedMCPServer:
             query: str,
             table: Optional[str] = None,
             limit: int = 10,
-            use_cache: bool = True
+            use_cache: bool = True,
+            access_token: Optional[AccessToken] = Depends(get_access_token)
         ) -> List[Dict[str, Any]]:
             """
             PostgreSQL을 사용한 관계형 데이터베이스 검색
@@ -1161,14 +1285,38 @@ class UnifiedMCPServer:
             Returns:
                 데이터베이스 레코드 목록
             """
+            start_time = datetime.now(timezone.utc)
+            tool_name = "search_database"
+            
+            # 사용자 컨텍스트 관리
+            user_context = await self._get_or_create_user_context(ctx, access_token)
+            
+            # 사용자 정보 추출
+            user_id, user_email, user_type = self._get_user_info_from_token(access_token)
+
+            logger.info(
+                "데이터베이스 검색 요청 시작",
+                extra={
+                    "query": query,
+                    "table": table,
+                    "limit": limit,
+                    "use_cache": use_cache,
+                    "user_id": user_id,
+                    "user_email": user_email,
+                    "user_type": user_type
+                }
+            )
+
             emoji = "🔍" if use_emoji else ""
             await ctx.info(f"{emoji} 데이터베이스 검색 중...")
             
             if "postgres" not in self.retrievers:
+                await self._record_tool_usage(ctx, tool_name, start_time, False, "PostgreSQL retriever not available")
                 raise ToolError("데이터베이스 검색을 사용할 수 없습니다")
             
             retriever = self.retrievers["postgres"]
             if not retriever.connected:
+                await self._record_tool_usage(ctx, tool_name, start_time, False, "PostgreSQL retriever not connected")
                 raise ToolError("데이터베이스 검색을 사용할 수 없습니다 - 연결되지 않음")
             
             # 쿼리 유형 로깅
@@ -1190,12 +1338,37 @@ class UnifiedMCPServer:
                 async for result in retriever.retrieve(query, limit=limit, table=table):
                     results.append(result)
                 
+                logger.info(
+                    "데이터베이스 검색 완료",
+                    extra={
+                        "results_count": len(results),
+                        "user_id": user_id,
+                        "user_type": user_type
+                    }
+                )
+
                 emoji = "✅" if use_emoji else ""
                 await ctx.info(f"{emoji} 데이터베이스 검색 완료: {len(results)}개 결과")
+                
+                # 성공적인 도구 사용 기록
+                await self._record_tool_usage(ctx, tool_name, start_time, True)
+                
                 return results
             except QueryError as e:
+                logger.error(
+                    "데이터베이스 검색 실패",
+                    extra={
+                        "error": str(e),
+                        "user_id": user_id,
+                        "user_type": user_type
+                    }
+                )
                 emoji = "❌" if use_emoji else ""
                 await ctx.error(f"{emoji} 데이터베이스 검색 실패: {str(e)}")
+                
+                # 실패한 도구 사용 기록
+                await self._record_tool_usage(ctx, tool_name, start_time, False, str(e))
+                
                 raise ToolError(str(e))
             finally:
                 # 캐시 설정 복원
@@ -1206,7 +1379,8 @@ class UnifiedMCPServer:
         async def search_all(
             ctx: Context,
             query: str,
-            limit: int = 10
+            limit: int = 10,
+            access_token: Optional[AccessToken] = Depends(get_access_token)
         ) -> Dict[str, Any]:
             """
             모든 가능한 리트리버에서 동시 검색
@@ -1218,6 +1392,26 @@ class UnifiedMCPServer:
             Returns:
                 모든 소스의 결과와 발생한 오류들
             """
+            start_time = datetime.now(timezone.utc)
+            tool_name = "search_all"
+            
+            # 사용자 컨텍스트 관리
+            user_context = await self._get_or_create_user_context(ctx, access_token)
+            
+            # 사용자 정보 추출
+            user_id, user_email, user_type = self._get_user_info_from_token(access_token)
+
+            logger.info(
+                "통합 검색 요청 시작",
+                extra={
+                    "query": query,
+                    "limit": limit,
+                    "user_id": user_id,
+                    "user_email": user_email,
+                    "user_type": user_type
+                }
+            )
+
             emoji = "🔍" if use_emoji else ""
             await ctx.info(f"{emoji} 모든 소스에서 동시 검색 시작...")
             
@@ -1228,100 +1422,204 @@ class UnifiedMCPServer:
             tasks = []
             for name, retriever in self.retrievers.items():
                 if retriever.connected:
-                    tasks.append((name, self._search_single_source(name, retriever, query, limit, ctx)))
+                    tasks.append((name, self._search_single_source(name, retriever, query, limit, ctx, user_id, user_type)))
             
             if not tasks:
+                logger.warning(
+                    "연결된 리트리버 없음",
+                    extra={
+                        "user_id": user_id,
+                        "user_type": user_type
+                    }
+                )
                 emoji = "⚠️" if use_emoji else ""
                 await ctx.warning(f"{emoji} 연결된 리트리버가 없습니다")
+                
+                # 도구 사용 기록 (실패)
+                await self._record_tool_usage(ctx, tool_name, start_time, False, "No connected retrievers")
+                
                 return {"results": {}, "errors": {"all": "사용 가능한 리트리버가 없습니다"}}
             
             # 모든 검색을 동시에 실행
             emoji = "🚀" if use_emoji else ""
             await ctx.info(f"{emoji} {len(tasks)}개 소스에서 동시 검색 중...")
             
-            # 동시 실행을 위해 TaskGroup 사용
+            # 예외 처리를 위한 플래그
+            task_group_failed = False
+            combined_error = ""
+            task_refs = []
+            
             try:
+                # 동시 실행을 위해 TaskGroup 사용
                 async with asyncio.TaskGroup() as tg:
-                    task_refs = []
                     for name, coro in tasks:
                         task = tg.create_task(coro)
                         task_refs.append((name, task))
+                        
             except* Exception as eg:
                 # TaskGroup에서 발생한 예외 처리
+                task_group_failed = True
+                error_messages = []
                 for e in eg.exceptions:
-                    logger.error(f"TaskGroup 오류: {e}")
+                    error_msg = f"TaskGroup 오류: {e}"
+                    logger.error(error_msg)
+                    error_messages.append(error_msg)
+                combined_error = "; ".join(error_messages)
             
-            # 결과 수집
-            for name, task in task_refs:
-                try:
-                    result = task.result()
-                    if "error" in result:
-                        errors[name] = result["error"]
-                    else:
-                        results[name] = result["results"]
-                except Exception as e:
-                    errors[name] = str(e)
-            
-            emoji = "✅" if use_emoji else ""
-            await ctx.info(
-                f"{emoji} 검색 완료: {len(results)}개 성공, {len(errors)}개 실패"
-            )
-            
-            return {
-                "results": results,
-                "errors": errors,
-                "sources_searched": len(results) + len(errors)
-            }
+            # TaskGroup 실행 결과 처리
+            if task_group_failed:
+                # 실패한 도구 사용 기록
+                await self._record_tool_usage(ctx, tool_name, start_time, False, combined_error)
+                
+                emoji = "❌" if use_emoji else ""
+                await ctx.error(f"{emoji} 통합 검색 중 오류 발생: {combined_error}")
+                
+                return {
+                    "results": {},
+                    "errors": {"taskgroup": combined_error},
+                    "sources_searched": 0
+                }
+            else:
+                # 정상 실행 - 결과 수집
+                for name, task in task_refs:
+                    try:
+                        result = task.result()
+                        if "error" in result:
+                            errors[name] = result["error"]
+                        else:
+                            results[name] = result["results"]
+                    except Exception as e:
+                        errors[name] = str(e)
+                
+                logger.info(
+                    "통합 검색 완료",
+                    extra={
+                        "results_count": sum(len(r) for r in results.values()) if results else 0,
+                        "successful_sources": len(results),
+                        "failed_sources": len(errors),
+                        "user_id": user_id,
+                        "user_type": user_type
+                    }
+                )
+
+                emoji = "✅" if use_emoji else ""
+                await ctx.info(
+                    f"{emoji} 검색 완료: {len(results)}개 성공, {len(errors)}개 실패"
+                )
+                
+                # 성공적인 도구 사용 기록 (부분적 성공도 성공으로 간주)
+                await self._record_tool_usage(ctx, tool_name, start_time, True)
+                
+                return {
+                    "results": results,
+                    "errors": errors,
+                    "sources_searched": len(results) + len(errors)
+                }
         
         @server.tool
-        async def health_check(ctx: Context) -> Dict[str, Any]:
+        async def health_check(
+            ctx: Context,
+            access_token: Optional[AccessToken] = Depends(get_access_token)
+        ) -> Dict[str, Any]:
             """
             모든 리트리버와 서버 구성 요소의 건강 상태 검사
             
             Returns:
                 포괄적인 건강 상태 정보
             """
+            start_time = datetime.now(timezone.utc)
+            tool_name = "health_check"
+            
+            # 사용자 컨텍스트 관리
+            user_context = await self._get_or_create_user_context(ctx, access_token)
+            
+            # 사용자 정보 추출
+            user_id, user_email, user_type = self._get_user_info_from_token(access_token)
+
+            logger.info(
+                "건강 상태 검사 요청",
+                extra={
+                    "user_id": user_id,
+                    "user_email": user_email,
+                    "user_type": user_type
+                }
+            )
+
             emoji = "🏥" if use_emoji else ""
             await ctx.info(f"{emoji} 건강 상태 검사 수행 중...")
             
-            health_status = {
-                "service": self.config.name,
-                "profile": self.config.profile.value,
-                "status": "healthy",
-                "features": self.config.get_enabled_features(),
-                "retrievers": {}
-            }
-            
-            # 추가 정보
-            if self.config.features["auth"]:
-                health_status["auth_enabled"] = True
-            
-            if self.config.features["context"] and self.context_store is not None:
-                health_status["context_store_size"] = len(self.context_store)
-            
-            # 리트리버 상태 확인
-            for name, retriever in self.retrievers.items():
-                try:
-                    status = await retriever.health_check()
-                    health_status["retrievers"][name] = {
-                        "connected": retriever.connected,
-                        "status": status
+            try:
+                health_status = {
+                    "service": self.config.name,
+                    "profile": self.config.profile.value,
+                    "status": "healthy",
+                    "features": self.config.get_enabled_features(),
+                    "retrievers": {}
+                }
+                
+                # 추가 정보
+                if self.config.features["auth"]:
+                    health_status["auth_enabled"] = True
+                
+                if self.config.features["context"] and self.context_store is not None:
+                    health_status["context_store_size"] = len(self.context_store)
+                
+                # 리트리버 상태 확인
+                for name, retriever in self.retrievers.items():
+                    try:
+                        status = await retriever.health_check()
+                        health_status["retrievers"][name] = {
+                            "connected": retriever.connected,
+                            "status": status
+                        }
+                    except Exception as e:
+                        health_status["retrievers"][name] = {
+                            "connected": False,
+                            "status": "error",
+                            "error": str(e)
+                        }
+                        health_status["status"] = "degraded"
+                
+                # 모든 리트리버가 비정상인 경우
+                if not any(r.get("connected", False) for r in health_status["retrievers"].values()):
+                    health_status["status"] = "unhealthy"
+                
+                logger.info(
+                    "건강 상태 검사 완료",
+                    extra={
+                        "overall_status": health_status["status"],
+                        "connected_retrievers": sum(1 for r in health_status["retrievers"].values() if r.get("connected", False)),
+                        "total_retrievers": len(health_status["retrievers"]),
+                        "user_id": user_id,
+                        "user_type": user_type
                     }
-                except Exception as e:
-                    health_status["retrievers"][name] = {
-                        "connected": False,
-                        "status": "error",
-                        "error": str(e)
+                )
+
+                emoji = "✅" if use_emoji else ""
+                await ctx.info(f"{emoji} 건강 상태 검사 완료: {health_status['status']}")
+                
+                # 성공적인 도구 사용 기록
+                await self._record_tool_usage(ctx, tool_name, start_time, True)
+                
+                return health_status
+                
+            except Exception as e:
+                logger.error(
+                    "건강 상태 검사 실패",
+                    extra={
+                        "error": str(e),
+                        "user_id": user_id,
+                        "user_type": user_type
                     }
-                    health_status["status"] = "degraded"
-            
-            # 모든 리트리버가 비정상인 경우
-            if not any(r.get("connected", False) for r in health_status["retrievers"].values()):
-                health_status["status"] = "unhealthy"
-            
-            emoji = "✅" if use_emoji else ""
-            await ctx.info(f"{emoji} 건강 상태 검사 완료: {health_status['status']}")
-            return health_status
+                )
+                
+                # 실패한 도구 사용 기록
+                await self._record_tool_usage(ctx, tool_name, start_time, False, str(e))
+                
+                emoji = "❌" if use_emoji else ""
+                await ctx.error(f"{emoji} 건강 상태 검사 실패: {str(e)}")
+                
+                raise ToolError(f"건강 상태 검사 실패: {str(e)}")
         
         # 캐시 관련 도구 (캐싱 활성화 시에만)
         if self.config.features["cache"]:
@@ -1419,7 +1717,9 @@ class UnifiedMCPServer:
         retriever: Retriever,
         query: str,
         limit: int,
-        ctx: Context
+        ctx: Context,
+        user_id: str = "anonymous",
+        user_type: str = "anonymous"
     ) -> Dict[str, Any]:
         """단일 리트리버 검색을 위한 도우미 함수"""
         try:
@@ -1427,26 +1727,178 @@ class UnifiedMCPServer:
             emoji = "🔸" if use_emoji else ""
             await ctx.info(f"  {emoji} {name} 검색 중...")
             
+            logger.info(
+                f"단일 소스 검색 시작",
+                extra={
+                    "source": name,
+                    "query": query,
+                    "limit": limit,
+                    "user_id": user_id,
+                    "user_type": user_type
+                }
+            )
+            
             results = []
             async for result in retriever.retrieve(query, limit=limit):
                 results.append(result)
+            
+            logger.info(
+                f"단일 소스 검색 완료",
+                extra={
+                    "source": name,
+                    "results_count": len(results),
+                    "user_id": user_id,
+                    "user_type": user_type
+                }
+            )
+            
             return {"results": results}
         except Exception as e:
+            logger.error(
+                f"단일 소스 검색 실패",
+                extra={
+                    "source": name,
+                    "error": str(e),
+                    "user_id": user_id,
+                    "user_type": user_type
+                }
+            )
             emoji = "❌" if use_emoji else ""
             await ctx.error(f"  {emoji} {name} 검색 오류: {str(e)}")
             return {"error": str(e)}
 
+    async def _get_or_create_user_context(
+        self, 
+        ctx: Context, 
+        access_token: Optional[AccessToken] = None
+    ) -> Optional[UserContext]:
+        """사용자 컨텍스트를 가져오거나 생성합니다."""
+        if not self.config.features["context"] or self.context_store is None:
+            return None
+        
+        request_id = getattr(ctx, '_request_id', str(uuid.uuid4()))
+        
+        # 기존 컨텍스트가 있으면 반환
+        if request_id in self.context_store:
+            user_context = self.context_store[request_id]
+        else:
+            # 새 컨텍스트 생성
+            user_context = UserContext()
+            user_context.request_id = request_id
+            user_context.start_time = datetime.now(timezone.utc)
+            self.context_store[request_id] = user_context
+        
+        # AccessToken으로부터 사용자 정보 업데이트
+        if access_token:
+            self._update_user_context_from_token(user_context, access_token)
+        
+        return user_context
+    
+    def _update_user_context_from_token(
+        self, 
+        user_context: UserContext, 
+        access_token: AccessToken
+    ) -> None:
+        """AccessToken으로부터 사용자 정보를 UserContext에 업데이트합니다."""
+        claims = self._extract_jwt_claims(access_token)
+        
+        user_data = {
+            "id": access_token.client_id,
+            "type": "service" if access_token.client_id == "internal-service" else "user",
+            "email": claims.get("email"),
+            "roles": claims.get("roles", []),
+            "sub": claims.get("sub"),
+            "token_type": claims.get("token_type")
+        }
+        user_context.set_user(user_data)
+    
+    async def _record_tool_usage(
+        self,
+        ctx: Context,
+        tool_name: str,
+        start_time: datetime,
+        success: bool = True,
+        error: Optional[str] = None
+    ) -> None:
+        """도구 사용 기록을 UserContext에 저장합니다."""
+        if not self.config.features["context"] or self.context_store is None:
+            return
+        
+        request_id = getattr(ctx, '_request_id', None)
+        if request_id and request_id in self.context_store:
+            user_context = self.context_store[request_id]
+            duration_ms = (datetime.now(timezone.utc) - start_time).total_seconds() * 1000
+            
+            tool_usage_record = {
+                "tool": tool_name,
+                "duration_ms": duration_ms,
+                "success": success,
+                "timestamp": datetime.now(timezone.utc).isoformat()
+            }
+            
+            if error:
+                tool_usage_record["error"] = error
+            
+            user_context.add_tool_usage(tool_name, duration_ms, success)
+            
+            logger.info(
+                "도구 사용 기록 저장",
+                extra={
+                    "tool_name": tool_name,
+                    "duration_ms": duration_ms,
+                    "success": success,
+                    "user_id": user_context.user.get("id") if user_context.user else None,
+                    "request_id": request_id
+                }
+            )
 
-def main():
-    """메인 실행 함수"""
+    
+    def _extract_jwt_claims(self, access_token: Optional[AccessToken]) -> Dict[str, Any]:
+        """AccessToken에서 JWT claims를 추출합니다."""
+        if not access_token or not access_token.resource:
+            return {}
+        
+        try:
+            import json
+            claims = json.loads(access_token.resource)
+            return claims if isinstance(claims, dict) else {}
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.warning(
+                "JWT claims 파싱 실패",
+                extra={
+                    "error": str(e),
+                    "resource": access_token.resource
+                }
+            )
+            return {}
+    
+    def _get_user_info_from_token(self, access_token: Optional[AccessToken]) -> tuple[str, Optional[str], str]:
+        """AccessToken에서 사용자 정보를 추출합니다."""
+        if not access_token:
+            return "anonymous", None, "anonymous"
+        
+        user_id = access_token.client_id
+        user_type = "service" if user_id == "internal-service" else "user"
+        
+        # JWT claims에서 이메일 추출
+        claims = self._extract_jwt_claims(access_token)
+        user_email = claims.get("email")
+        
+        return user_id, user_email, user_type
+
+
+async def main():
+    """메인 실행 함수 (비동기)"""
     # 설정 로드
     config = ServerConfig.from_env()
     
+    # 무조건 HTTP 전송으로 설정
+    config.transport = "http"
+    
     logger.info(
-        "통합 MCP 서버 시작",
+        "통합 MCP 서버 시작 (HTTP 전용, 비동기)",
         profile=config.profile.value,
-        transport=config.transport,
-        port=config.port if config.transport == "http" else "N/A",
+        port=config.port,
         features=config.get_enabled_features()
     )
     
@@ -1454,17 +1906,19 @@ def main():
     unified_server = UnifiedMCPServer(config)
     mcp = unified_server.create_server()
     
-    # 실행
-    if config.transport == "http":
-        logger.info(f"HTTP 모드로 서버 시작 (포트: {config.port})")
-        mcp.run(transport="http", port=config.port)
-    else:
-        logger.info("STDIO 모드로 서버 시작")
-        mcp.run()
+    # HTTP로만 실행 (Docker 배포용) - 비동기 방식
+    logger.info(f"HTTP 모드로 서버 시작 - http://0.0.0.0:{config.port}/mcp")
+    await mcp.run_async(
+        transport="http",
+        host="0.0.0.0",  # Docker 컨테이너에서 외부 접근 허용
+        port=config.port,
+        path="/mcp",  # MCP 엔드포인트 경로
+        log_level="info"
+    )
 
 
 # 하위 호환성을 위한 서버 인스턴스
 server = None
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
