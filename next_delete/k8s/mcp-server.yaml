@@ -1,0 +1,147 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mcp-config
+  namespace: mcp-retriever
+data:
+  LOG_LEVEL: "INFO"
+  POSTGRES_DSN: "postgresql://mcp_user:mcp_password@postgres:5432/mcp_retriever"
+  QDRANT_HOST: "qdrant"
+  QDRANT_PORT: "6333"
+  REDIS_URL: "redis://:mcp_redis_password@redis:6379/1"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: mcp-secrets
+  namespace: mcp-retriever
+type: Opaque
+data:
+  JWT_SECRET_KEY: eW91ci1zZWNyZXQta2V5LWNoYW5nZS1pbi1wcm9kdWN0aW9u  # base64 encoded
+  TAVILY_API_KEY: ""  # Add your base64 encoded API key
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: auth-gateway
+  namespace: mcp-retriever
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: auth-gateway
+  template:
+    metadata:
+      labels:
+        app: auth-gateway
+    spec:
+      containers:
+      - name: auth-gateway
+        image: mcp-retriever:latest
+        imagePullPolicy: IfNotPresent
+        command: ["uv", "run", "python", "-m", "src.auth.server"]
+        ports:
+        - containerPort: 8000
+        env:
+        - name: JWT_SECRET_KEY
+          valueFrom:
+            secretKeyRef:
+              name: mcp-secrets
+              key: JWT_SECRET_KEY
+        envFrom:
+        - configMapRef:
+            name: mcp-config
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 10
+          periodSeconds: 5
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mcp-server
+  namespace: mcp-retriever
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: mcp-server
+  template:
+    metadata:
+      labels:
+        app: mcp-server
+    spec:
+      containers:
+      - name: mcp-server
+        image: mcp-retriever:latest
+        imagePullPolicy: IfNotPresent
+        command: ["uv", "run", "python", "-m", "src.server"]
+        ports:
+        - containerPort: 8001
+        env:
+        - name: TAVILY_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: mcp-secrets
+              key: TAVILY_API_KEY
+        envFrom:
+        - configMapRef:
+            name: mcp-config
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8001
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8001
+          initialDelaySeconds: 10
+          periodSeconds: 5
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "1"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: auth-gateway
+  namespace: mcp-retriever
+spec:
+  selector:
+    app: auth-gateway
+  ports:
+  - port: 8000
+    targetPort: 8000
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mcp-server
+  namespace: mcp-retriever
+spec:
+  selector:
+    app: mcp-server
+  ports:
+  - port: 8001
+    targetPort: 8001
