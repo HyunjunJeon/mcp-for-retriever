@@ -1,1 +1,0 @@
-"""Playwright E2E tests for MCP Retriever."""

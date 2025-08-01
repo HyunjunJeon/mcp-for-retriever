@@ -1,10 +1,8 @@
 """역할 기반 접근 제어(RBAC) 서비스 테스트"""
 
-from typing import Any
-
 import pytest
 
-from src.auth.models import Permission, Role, ResourceType, ActionType
+from src.auth.models import Permission, ResourceType, ActionType
 from src.auth.services.rbac_service import RBACService, PermissionDeniedError
 
 
@@ -35,7 +33,7 @@ class TestRBACService:
                 Permission(resource=ResourceType.WEB_SEARCH, action=ActionType.READ),
             ],
         }
-        
+
         return RBACService(role_permissions=permissions)
 
     def test_check_permission_allowed(self, rbac_service: RBACService) -> None:
@@ -123,7 +121,7 @@ class TestRBACService:
         # When & Then
         with pytest.raises(PermissionDeniedError) as exc_info:
             rbac_service.require_permission(roles, resource, action)
-        
+
         assert resource.value in str(exc_info.value)
         assert action.value in str(exc_info.value)
 
@@ -141,7 +139,9 @@ class TestRBACService:
         assert any(p.resource == ResourceType.WEB_SEARCH for p in permissions)
         assert any(p.resource == ResourceType.VECTOR_DB for p in permissions)
 
-    def test_get_user_permissions_multiple_roles(self, rbac_service: RBACService) -> None:
+    def test_get_user_permissions_multiple_roles(
+        self, rbac_service: RBACService
+    ) -> None:
         """다중 역할의 권한 목록 조회 테스트"""
         # Given
         roles = ["user", "guest"]
@@ -151,36 +151,50 @@ class TestRBACService:
 
         # Then - 중복 제거되어야 함
         assert len(permissions) == 2  # user의 2개 권한 (guest는 user의 부분집합)
-        
+
     def test_check_tool_permission_web_search(self, rbac_service: RBACService) -> None:
         """웹 검색 도구 권한 확인 테스트"""
         # Given
         roles_allowed = ["user", "admin"]
-        roles_denied = ["guest"]  # guest는 읽기만 가능하지만 도구 실행은 WRITE 권한 필요
+        roles_denied = [
+            "guest"
+        ]  # guest는 읽기만 가능하지만 도구 실행은 WRITE 권한 필요
 
         # When & Then
         assert rbac_service.check_tool_permission(roles_allowed, "search_web") is True
         assert rbac_service.check_tool_permission(roles_denied, "search_web") is False
 
-    def test_check_tool_permission_vector_search(self, rbac_service: RBACService) -> None:
+    def test_check_tool_permission_vector_search(
+        self, rbac_service: RBACService
+    ) -> None:
         """벡터 검색 도구 권한 확인 테스트"""
         # Given
         roles_allowed = ["admin"]
         roles_denied = ["user", "guest"]
 
         # When & Then
-        assert rbac_service.check_tool_permission(roles_allowed, "search_vectors") is True
-        assert rbac_service.check_tool_permission(roles_denied, "search_vectors") is False
+        assert (
+            rbac_service.check_tool_permission(roles_allowed, "search_vectors") is True
+        )
+        assert (
+            rbac_service.check_tool_permission(roles_denied, "search_vectors") is False
+        )
 
-    def test_check_tool_permission_database_search(self, rbac_service: RBACService) -> None:
+    def test_check_tool_permission_database_search(
+        self, rbac_service: RBACService
+    ) -> None:
         """데이터베이스 검색 도구 권한 확인 테스트"""
         # Given
         roles_allowed = ["admin"]
         roles_denied = ["user", "guest"]
 
         # When & Then
-        assert rbac_service.check_tool_permission(roles_allowed, "search_database") is True
-        assert rbac_service.check_tool_permission(roles_denied, "search_database") is False
+        assert (
+            rbac_service.check_tool_permission(roles_allowed, "search_database") is True
+        )
+        assert (
+            rbac_service.check_tool_permission(roles_denied, "search_database") is False
+        )
 
     def test_check_tool_permission_search_all(self, rbac_service: RBACService) -> None:
         """전체 검색 도구 권한 확인 테스트"""
@@ -192,7 +206,9 @@ class TestRBACService:
         assert rbac_service.check_tool_permission(roles_allowed, "search_all") is True
         assert rbac_service.check_tool_permission(roles_denied, "search_all") is False
 
-    def test_check_tool_permission_unknown_tool(self, rbac_service: RBACService) -> None:
+    def test_check_tool_permission_unknown_tool(
+        self, rbac_service: RBACService
+    ) -> None:
         """알 수 없는 도구 권한 확인 테스트"""
         # Given
         roles = ["admin"]
@@ -247,7 +263,7 @@ class TestRBACService:
         """권한 상속 테스트 (상위 권한이 하위 권한 포함)"""
         # Given - WRITE 권한은 READ 권한을 암시적으로 포함
         rbac_service.enable_permission_inheritance = True
-        
+
         # 새 역할에 WRITE 권한만 부여
         editor_role = "editor"
         rbac_service.add_role_permission(

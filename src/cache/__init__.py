@@ -12,7 +12,7 @@ MCP 서버용 캐싱 시스템 모듈
         - TTL 기반 자동 만료 관리
         - JSON 직렬화/역직렬화
         - 패턴 매칭 기반 캐시 무효화
-    
+
     CacheConfig: 캐시 설정 모델
         - Redis 연결 설정
         - TTL 정책 관리
@@ -28,17 +28,17 @@ MCP 서버용 캐싱 시스템 모듈
 사용 예시:
     ```python
     from src.cache import RedisCache, CacheConfig
-    
+
     # 캐시 설정 및 초기화
     config = CacheConfig(
         redis_url="redis://localhost:6379/0",
         default_ttl=300,  # 5분 기본 TTL
         key_prefix="mcp_cache"
     )
-    
+
     cache = RedisCache(config)
     await cache.connect()
-    
+
     # 데이터 저장 및 조회
     await cache.set("search", "python_tutorial", results, ttl=600)
     cached_results = await cache.get("search", "python_tutorial")
@@ -49,8 +49,6 @@ MCP 서버용 캐싱 시스템 모듈
     - Factory 패턴: 캐시 인스턴스 생성
     - Decorator 패턴: 자동 캐싱 기능
     - Observer 패턴: 캐시 이벤트 처리
-
-작성일: 2024-01-30
 """
 
 # Redis 기반 캐시 시스템의 핵심 컴포넌트들

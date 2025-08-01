@@ -30,3 +30,7 @@ CLAUDE.md
 .serena/
 .cursors/
 *mcp.json*
+
+# Log and DB
+*.db
+*.log

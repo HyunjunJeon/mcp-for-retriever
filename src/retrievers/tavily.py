@@ -13,8 +13,6 @@ Tavily는 AI 최적화 검색 결과를 제공하는 전문 검색 API입니다.
 
 환경 변수:
     TAVILY_API_KEY: Tavily API 키 (필수)
-
-작성일: 2024-01-30
 """
 
 from typing import AsyncIterator, Any
@@ -29,16 +27,17 @@ from src.retrievers.base import (
     QueryResult,
     RetrieverConfig,
 )
+from src.utils.connection_manager import HTTPSessionManager
 
 
 class TavilyRetriever(Retriever):
     """
     Tavily 웹 검색 API를 사용하는 리트리버 구현체
-    
+
     Tavily API를 통해 AI 최적화된 웹 검색 결과를 제공합니다.
     각 검색 결과는 관련성 점수와 함께 제공되며, 비동기 스트리밍으로
     효율적으로 처리됩니다.
-    
+
     Attributes:
         BASE_URL (str): Tavily API 기본 URL
         api_key (str): API 인증 키
@@ -52,7 +51,7 @@ class TavilyRetriever(Retriever):
     def __init__(self, config: RetrieverConfig):
         """
         Tavily 리트리버 초기화
-        
+
         설정 정보를 받아 Tavily API 클라이언트를 초기화합니다.
 
         Args:
@@ -78,13 +77,21 @@ class TavilyRetriever(Retriever):
         self.search_depth = config.get("search_depth", "basic")
         self.timeout = config.get("timeout", 30)
 
-        # HTTP 클라이언트는 connect() 시 생성
-        self._client: httpx.AsyncClient | None = None
+        # HTTP 세션 매니저 설정
+        session_config = {
+            "max_connections": config.get("max_connections", 100),
+            "max_keepalive_connections": config.get("max_keepalive_connections", 20),
+            "keepalive_expiry": config.get("keepalive_expiry", 30),
+            "timeout": self.timeout,
+            "retries": config.get("retries", 3),
+        }
+
+        self._session_manager = HTTPSessionManager(session_config)
 
     async def connect(self) -> None:
         """
         Tavily API에 연결
-        
+
         비동기 HTTP 클라이언트를 생성하고 연결을 테스트합니다.
         연결 풀을 사용하여 효율적인 HTTP 통신을 지원합니다.
 
@@ -95,20 +102,18 @@ class TavilyRetriever(Retriever):
                 - 서비스 이용 불가
         """
         try:
-            # 비동기 HTTP 클라이언트 생성
-            self._client = httpx.AsyncClient(
-                base_url=self.BASE_URL,
-                timeout=self.timeout,
-                headers={
-                    "Content-Type": "application/json",
-                },
-            )
+            # HTTP 세션 매니저 초기화
+            await self._session_manager.initialize()
 
             # 연결 테스트
             await self._test_connection()
 
             self._connected = True
-            self._log_operation("connect", status="success")
+            self._log_operation(
+                "connect",
+                status="success",
+                reuse_rate=self._session_manager.metrics.calculate_reuse_rate(),
+            )
 
         except Exception as e:
             self._connected = False
@@ -120,23 +125,25 @@ class TavilyRetriever(Retriever):
     async def disconnect(self) -> None:
         """
         Tavily API 연결 종료
-        
+
         HTTP 클라이언트를 닫고 리소스를 정리합니다.
         예외가 발생해도 연결 상태를 초기화합니다.
         """
-        if self._client:
-            await self._client.aclose()
-            self._client = None
+        await self._session_manager.close()
 
         self._connected = False
-        self._log_operation("disconnect")
+        self._log_operation(
+            "disconnect",
+            total_requests=self._session_manager.metrics.total_requests,
+            reuse_rate=self._session_manager.metrics.calculate_reuse_rate(),
+        )
 
     async def retrieve(
         self, query: str, limit: int = 10, **kwargs: Any
     ) -> AsyncIterator[QueryResult]:
         """
         Tavily API를 사용한 웹 검색
-        
+
         주어진 쿼리로 웹을 검색하고 결과를 비동기 스트리밍으로 반환합니다.
         각 결과는 개별적으로 yield되어 메모리 효율성을 보장합니다.
 
@@ -185,7 +192,7 @@ class TavilyRetriever(Retriever):
     async def health_check(self) -> RetrieverHealth:
         """
         Tavily API 상태 확인
-        
+
         API 연결 상태와 서비스 가용성을 확인합니다.
 
         Returns:
@@ -204,16 +211,19 @@ class TavilyRetriever(Retriever):
             )
 
         try:
-            # API 연결 테스트
-            await self._test_connection()
+            # 세션 매니저의 health check 사용
+            session_health = await self._session_manager.health_check()
 
             return RetrieverHealth(
-                healthy=True,
+                healthy=session_health["status"] == "healthy",
                 service_name="TavilyRetriever",
                 details={
                     "connected": True,
                     "api_endpoint": self.BASE_URL,
                     "timeout": self.timeout,
+                    "total_requests": session_health.get("total_requests", 0),
+                    "connection_errors": session_health.get("connection_errors", 0),
+                    "reuse_rate": session_health.get("reuse_rate", 0),
                 },
             )
 
@@ -228,27 +238,29 @@ class TavilyRetriever(Retriever):
     async def _test_connection(self) -> bool:
         """
         API 연결 테스트
-        
-        최소한의 요청으로 API 연결을 확인합니다.
-        Tavily API는 별도의 테스트 엔드포인트가 없으므로
-        HTTP 클라이언트의 존재 여부만 확인합니다.
+
+        Tavily API 연결을 확인합니다.
+        Tavily API는 별도의 테스트 엔드포인트가 없고 HEAD 메서드를 지원하지 않으므로,
+        실제 검색 요청을 보내는 대신 API 키가 설정되어 있는지만 확인합니다.
 
         Returns:
             bool: 연결이 정상이면 True
 
         Raises:
-            Exception: 연결 테스트 실패 시
+            Exception: API 키가 없을 때
         """
-        # Tavily는 검색 없이는 테스트할 수 없음
-        # 클라이언트 존재 여부만 확인
-        if self._client:
-            return True
-        raise Exception("HTTP client not initialized")
+        # API 키 확인
+        if not self.config.get("api_key"):
+            raise ValueError("Tavily API key is not configured")
+
+        # Tavily는 실제 검색 요청에서만 API 키 유효성을 확인하므로
+        # 여기서는 키 존재 여부만 확인
+        return True
 
     async def _search(self, query: str, limit: int, **kwargs: Any) -> dict[str, Any]:
         """
         실제 API 검색 요청 수행
-        
+
         Tavily API에 POST 요청을 보내고 결과를 받아옵니다.
         속도 제한(429) 에러에 대해 자동 재시도를 수행합니다.
 
@@ -267,9 +279,6 @@ class TavilyRetriever(Retriever):
             httpx.HTTPError: API 요청 실패 시
             RuntimeError: 클라이언트 초기화 오류
         """
-        if not self._client:
-            raise RuntimeError("HTTP client not initialized")
-
         # 검색 매개변수 준비
         search_params = {
             "api_key": self.api_key,
@@ -283,9 +292,12 @@ class TavilyRetriever(Retriever):
         max_retries = 3
         for attempt in range(max_retries):
             try:
-                response = await self._client.post("/search", json=search_params)
-                response.raise_for_status()
-                return response.json()
+                async with self._session_manager.session() as session:
+                    response = await session.post(
+                        f"{self.BASE_URL}/search", json=search_params
+                    )
+                    response.raise_for_status()
+                    return response.json()
 
             except httpx.HTTPStatusError as e:
                 if e.response.status_code == 429:  # 속도 제한
@@ -309,7 +321,7 @@ class TavilyRetriever(Retriever):
     def _format_result(self, result: dict[str, Any]) -> QueryResult:
         """
         API 결과를 표준 QueryResult 형식으로 변환
-        
+
         Tavily API의 응답 형식을 MCP 서버의 표준 결과 형식으로
         변환합니다. 모든 리트리버가 동일한 형식을 사용하도록 합니다.
 

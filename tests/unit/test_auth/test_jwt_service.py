@@ -1,13 +1,11 @@
 """JWT 토큰 서비스 테스트"""
 
-import asyncio
 from datetime import datetime, timedelta, UTC
-from typing import Any
 
 import pytest
-from jose import jwt, JWTError
+from jose import jwt
 
-from src.auth.services.jwt_service import JWTService, TokenData
+from src.auth.services.jwt_service import JWTService
 
 
 class TestJWTService:
@@ -176,10 +174,10 @@ class TestJWTService:
         user_id = "test-user-123"
         email = "test@example.com"
         roles = ["user", "admin"]
-        
+
         # 먼저 리프레시 토큰 생성
         refresh_token = jwt_service.create_refresh_token(user_id=user_id)
-        
+
         # When
         new_access_token = jwt_service.refresh_access_token(
             refresh_token=refresh_token,
@@ -189,7 +187,7 @@ class TestJWTService:
 
         # Then
         assert new_access_token is not None
-        
+
         # 새 액세스 토큰 검증
         token_data = jwt_service.decode_token(new_access_token)
         assert token_data is not None
@@ -292,7 +290,9 @@ class TestJWTService:
         assert decoded["scopes"] == scopes
         assert decoded["type"] == "access"
 
-    def test_create_token_with_resource_permissions(self, jwt_service: JWTService) -> None:
+    def test_create_token_with_resource_permissions(
+        self, jwt_service: JWTService
+    ) -> None:
         """리소스 권한이 포함된 토큰 생성 테스트"""
         # Given
         user_id = "test-user-123"
@@ -301,7 +301,7 @@ class TestJWTService:
         resource_permissions = {
             "collection1": ["read", "write"],
             "table1": ["read"],
-            "collection2": ["read", "write", "delete"]
+            "collection2": ["read", "write", "delete"],
         }
 
         # When
@@ -335,10 +335,7 @@ class TestJWTService:
         email = "test@example.com"
         roles = ["user", "admin"]
         scopes = ["read:vectors", "write:database"]
-        resource_permissions = {
-            "collection1": ["read", "write"],
-            "table1": ["read"]
-        }
+        resource_permissions = {"collection1": ["read", "write"], "table1": ["read"]}
 
         # When
         token = jwt_service.create_access_token(
@@ -383,7 +380,9 @@ class TestJWTService:
         assert token_data.scopes == scopes
         assert token_data.resource_permissions is None  # 포함되지 않음
 
-    def test_decode_token_with_resource_permissions(self, jwt_service: JWTService) -> None:
+    def test_decode_token_with_resource_permissions(
+        self, jwt_service: JWTService
+    ) -> None:
         """리소스 권한이 포함된 토큰 디코드 테스트"""
         # Given
         user_id = "test-user-123"
@@ -414,7 +413,7 @@ class TestJWTService:
         user_id = "test-user-123"
         email = "test@example.com"
         roles = ["user"]
-        
+
         # 기존 방식으로 토큰 생성 (scopes, resource_permissions 없음)
         legacy_token = jwt_service.create_access_token(
             user_id=user_id,
@@ -434,7 +433,9 @@ class TestJWTService:
         assert token_data.scopes is None  # 새 필드는 None으로 기본값
         assert token_data.resource_permissions is None  # 새 필드는 None으로 기본값
 
-    def test_backward_compatibility_manual_legacy_token(self, jwt_service: JWTService) -> None:
+    def test_backward_compatibility_manual_legacy_token(
+        self, jwt_service: JWTService
+    ) -> None:
         """수동으로 생성한 기존 토큰 형식 호환성 테스트"""
         # Given - 기존 토큰 형식을 수동으로 생성 (실제 기존 시스템에서 발급된 토큰 시뮬레이션)
         payload = {
@@ -494,12 +495,12 @@ class TestJWTService:
         # Then - 두 토큰 모두 정상 디코드, 기본 필드들은 동일
         assert legacy_data is not None
         assert new_data is not None
-        
+
         # 공통 필드 검증
         assert legacy_data.user_id == new_data.user_id == user_id
         assert legacy_data.email == new_data.email == email
         assert legacy_data.roles == new_data.roles == roles
-        
+
         # 새 필드 차이 검증
         assert legacy_data.scopes is None
         assert legacy_data.resource_permissions is None
@@ -562,11 +563,11 @@ class TestJWTService:
         # Then
         assert data_none is not None
         assert data_empty is not None
-        
+
         # None인 경우 필드가 토큰에 포함되지 않음
         assert data_none.scopes is None
         assert data_none.resource_permissions is None
-        
+
         # 빈 값인 경우 빈 컨테이너로 포함됨
         assert data_empty.scopes == []
         assert data_empty.resource_permissions == {}

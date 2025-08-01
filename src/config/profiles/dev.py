@@ -12,7 +12,7 @@ from ..settings import (
     CacheConfig,
     RateLimitConfig,
     LoggingConfig,
-    RetrieverConfig
+    RetrieverConfig,
 )
 
 # 개발 환경 설정
@@ -21,7 +21,6 @@ DEV_CONFIG = ServerConfig(
     profile=ServerProfile.COMPLETE,
     transport="http",
     port=8001,
-    
     # 개발 환경에서는 모든 기능 활성화 (테스트 목적)
     features={
         "auth": True,
@@ -33,7 +32,6 @@ DEV_CONFIG = ServerConfig(
         "error_handler": True,
         "enhanced_logging": True,
     },
-    
     # 개발용 인증 설정 (보안 완화)
     auth_config=AuthConfig(
         internal_api_key="dev-api-key-for-testing-only",
@@ -44,24 +42,21 @@ DEV_CONFIG = ServerConfig(
         jwt_refresh_token_expire_days=7,
         require_auth=True,  # 인증 필수 - 잘못된 토큰은 항상 거부
     ),
-    
     # 개발용 캐시 설정 (짧은 TTL)
     cache_config=CacheConfig(
         redis_url="redis://localhost:6379/0",
-        cache_ttl_web=60,      # 1분 (빠른 테스트)
+        cache_ttl_web=60,  # 1분 (빠른 테스트)
         cache_ttl_vector=120,  # 2분
-        cache_ttl_db=90,       # 1.5분
-        cache_ttl_all=60,      # 1분
+        cache_ttl_db=90,  # 1.5분
+        cache_ttl_all=60,  # 1분
         enable_cache_stats=True,
     ),
-    
     # 개발용 속도 제한 (관대함) - 검증 통과를 위해 수정
     rate_limit_config=RateLimitConfig(
         requests_per_minute=100,
         requests_per_hour=6000,  # 100 * 60 = 6000
         burst_size=50,
     ),
-    
     # 개발용 로깅 (상세)
     logging_config=LoggingConfig(
         log_level="DEBUG",
@@ -70,7 +65,6 @@ DEV_CONFIG = ServerConfig(
         use_emoji=True,
         sensitive_fields=["password", "token"],  # 최소한의 마스킹
     ),
-    
     # 개발용 리트리버 설정
     retriever_config=RetrieverConfig(
         tavily_api_key=None,  # 환경 변수에서 로드

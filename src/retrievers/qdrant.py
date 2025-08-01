@@ -15,12 +15,9 @@ Qdrant는 고성능 벡터 검색 엔진으로, 대규모 임베딩 데이터를
     QDRANT_HOST: Qdrant 서버 호스트 (기본값: localhost)
     QDRANT_PORT: Qdrant 서버 포트 (기본값: 6333)
     QDRANT_API_KEY: API 키 (선택사항)
-
-작성일: 2024-01-30
 """
 
 from typing import AsyncIterator, Any, Optional, Callable
-from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct
 
 from src.retrievers.base import (
@@ -31,16 +28,17 @@ from src.retrievers.base import (
     QueryResult,
     RetrieverConfig,
 )
+from src.utils.connection_manager import QdrantClientManager
 
 
 class QdrantRetriever(Retriever):
     """
     Qdrant 벡터 데이터베이스를 사용하는 리트리버 구현체
-    
+
     Qdrant를 통해 고차원 벡터 공간에서 유사한 벡터를 검색합니다.
     텍스트를 임베딩으로 변환한 후 코사인 유사도 등의 거리 메트릭을
     사용하여 가장 유사한 결과를 찾습니다.
-    
+
     Attributes:
         host (str): Qdrant 서버 호스트
         port (int): Qdrant 서버 포트
@@ -49,13 +47,13 @@ class QdrantRetriever(Retriever):
         embedding_model (str): 임베딩 모델 이름
         embedding_dim (int): 임베딩 차원 크기
     """
-    
+
     def __init__(self, config: RetrieverConfig):
         """
         Qdrant 리트리버 초기화
-        
+
         설정 정보를 받아 Qdrant 클라이언트를 초기화합니다.
-        
+
         Args:
             config: 설정 딕셔너리
                 - host (str): Qdrant 서버 호스트 (필수)
@@ -69,34 +67,43 @@ class QdrantRetriever(Retriever):
                     - OpenAI Ada-002: 1536
                     - OpenAI 3-small: 1536
                     - Cohere: 1024
-                
+
         Raises:
             ValueError: host가 제공되지 않은 경우
         """
         super().__init__(config)
-        
+
         # 설정 추출 및 검증
         self.host = config.get("host")
         if not self.host:
             raise ValueError("host is required for QdrantRetriever")
-        
+
         self.port = config.get("port", 6333)
         self.api_key = config.get("api_key")
         self.timeout = config.get("timeout", 30)
         self.embedding_model = config.get("embedding_model", "text-embedding-ada-002")
         self.embedding_dim = config.get("embedding_dim", 1536)
-        
-        # 클라이언트와 임베딩 함수는 connect() 시 생성
-        self._client: Optional[QdrantClient] = None
+
+        # Qdrant client manager 설정
+        client_config = {
+            "host": self.host,
+            "port": self.port,
+            "grpc_port": config.get("grpc_port", 6334),
+            "api_key": self.api_key,
+            "timeout": self.timeout,
+            "prefer_grpc": config.get("prefer_grpc", True),
+        }
+
+        self._client_manager = QdrantClientManager(client_config)
         self._embed_text: Optional[Callable] = None
-    
+
     async def connect(self) -> None:
         """
         Qdrant 서버에 연결
-        
+
         Qdrant 클라이언트를 생성하고 연결을 테스트합니다.
         gRPC 또는 HTTP 프로토콜을 사용하여 통신합니다.
-        
+
         Raises:
             ConnectionError: Qdrant 연결 실패 시
                 - 네트워크 오류
@@ -104,60 +111,57 @@ class QdrantRetriever(Retriever):
                 - 인증 실패
         """
         try:
-            # Qdrant 클라이언트 생성
-            # 메모리 모드 지원 (host가 ":memory:"인 경우)
-            if self.host == ":memory:":
-                self._client = QdrantClient(":memory:")
-            else:
-                self._client = QdrantClient(
-                    host=self.host,
-                    port=self.port,
-                    api_key=self.api_key,
-                    timeout=self.timeout
-                )
-            
-            # 연결 테스트 (컨렉션 목록 조회)
+            # Qdrant client manager를 통한 클라이언트 획득
+            # 메모리 모드 처리는 manager 내부에서 수행
+            await self._client_manager.get_client()
+
+            # 연결 테스트
             await self._test_connection()
-            
+
             # 임베딩 함수 초기화 (실제 구현에서는 실제 임베딩 서비스 사용)
             self._embed_text = self._create_embedding_function()
-            
+
             self._connected = True
-            self._log_operation("connect", status="success")
-            
+            self._log_operation(
+                "connect",
+                status="success",
+                reuse_rate=self._client_manager.metrics.calculate_reuse_rate(),
+            )
+
         except Exception as e:
             self._connected = False
             self._log_operation("connect", status="failed", error=str(e))
             raise ConnectionError(
                 f"Failed to connect to Qdrant: {e}", "QdrantRetriever"
             )
-    
+
     async def disconnect(self) -> None:
         """
         Qdrant 연결 종료
-        
+
         클라이언트 연결을 닫고 리소스를 정리합니다.
         모든 핑들링된 연결이 안전하게 종료됩니다.
         """
-        if self._client:
-            # Qdrant client close is synchronous
-            self._client.close()
-            self._client = None
-        
+        await self._client_manager.close()
+
         self._embed_text = None
         self._connected = False
-        self._log_operation("disconnect")
-    
+        self._log_operation(
+            "disconnect",
+            total_requests=self._client_manager.metrics.total_requests,
+            reuse_rate=self._client_manager.metrics.calculate_reuse_rate(),
+        )
+
     async def retrieve(
         self, query: str, limit: int = 10, **kwargs: Any
     ) -> AsyncIterator[QueryResult]:
         """
         Qdrant에서 유사한 벡터 검색
-        
+
         주어진 텍스트를 임베딩으로 변환한 후 벡터 공간에서
         가장 유사한 벡터들을 검색합니다. kNN (k-Nearest Neighbors)
         알고리즘을 사용하여 효율적으로 검색합니다.
-        
+
         Args:
             query (str): 검색할 텍스트 쿼리
             limit (int): 반환할 최대 결과 수 (기본값: 10)
@@ -168,7 +172,7 @@ class QdrantRetriever(Retriever):
                     - must: 필수 조건
                     - should: 선택 조건
                     - must_not: 제외 조건
-                
+
         Yields:
             QueryResult: 검색 결과 딕셔너리
                 - id: 벡터 ID
@@ -176,7 +180,7 @@ class QdrantRetriever(Retriever):
                 - text: 원본 텍스트
                 - source: 소스 이름 ("qdrant")
                 - 기타 메타데이터 필드
-            
+
         Raises:
             ConnectionError: 연결되지 않은 경우
             QueryError: 검색 실패 시
@@ -186,40 +190,41 @@ class QdrantRetriever(Retriever):
         """
         if not self._connected:
             raise ConnectionError("Not connected to Qdrant", "QdrantRetriever")
-        
+
         collection = kwargs.get("collection")
         if not collection:
             raise QueryError("Collection name is required", "QdrantRetriever")
-        
+
         try:
             # 쿼리 텍스트를 임베딩으로 변환
             query_vector = await self._embed_text(query)
-            
-            # 벡터 검색 수행 (Qdrant client search is synchronous)
-            results = self._client.search(
+
+            # 클라이언트 획듍 및 벡터 검색 수행
+            client = await self._client_manager.get_client()
+            results = client.search(
                 collection_name=collection,
                 query_vector=query_vector,
                 limit=limit,
                 score_threshold=kwargs.get("score_threshold"),
-                query_filter=kwargs.get("filter")
+                query_filter=kwargs.get("filter"),
             )
-            
+
             # 결과 필터링 및 yield
             score_threshold = kwargs.get("score_threshold", 0.0)
             for result in results:
                 if result.score >= score_threshold:
                     yield self._format_result(result)
-                    
+
         except Exception as e:
             self._log_operation("retrieve", status="failed", error=str(e))
             raise QueryError(f"Search failed: {e}", "QdrantRetriever")
-    
+
     async def health_check(self) -> RetrieverHealth:
         """
         Qdrant 서비스 상태 확인
-        
+
         Qdrant 서버의 상태와 컨렉션 정보를 확인합니다.
-        
+
         Returns:
             RetrieverHealth: 현재 상태 정보
                 - healthy: 정상 작동 여부
@@ -232,44 +237,46 @@ class QdrantRetriever(Retriever):
                 healthy=False,
                 service_name="QdrantRetriever",
                 details={"connected": False},
-                error="Not connected"
+                error="Not connected",
             )
-        
+
         try:
-            # 컨렉션 정보 조회 (Qdrant client method is synchronous)
-            collections_info = self._client.get_collections()
-            collections_count = len(collections_info.collections)
-            
+            # Client manager의 health check 사용
+            client_health = await self._client_manager.health_check()
+
             return RetrieverHealth(
-                healthy=True,
+                healthy=client_health["status"] in ["healthy", "reconnected"],
                 service_name="QdrantRetriever",
                 details={
                     "connected": True,
                     "host": f"{self.host}:{self.port}",
-                    "collections_count": collections_count,
-                }
+                    "collections_count": client_health.get("collections_count", 0),
+                    "total_requests": client_health.get("total_requests", 0),
+                    "connection_errors": client_health.get("connection_errors", 0),
+                    "reuse_rate": client_health.get("reuse_rate", 0),
+                },
             )
-            
+
         except Exception as e:
             return RetrieverHealth(
                 healthy=False,
                 service_name="QdrantRetriever",
                 details={"connected": self._connected},
-                error=str(e)
+                error=str(e),
             )
-    
+
     async def create_collection(
         self,
         collection_name: str,
         vector_size: Optional[int] = None,
-        distance: Distance = Distance.COSINE
+        distance: Distance = Distance.COSINE,
     ) -> None:
         """
         Qdrant에 새 컨렉션 생성
-        
+
         벡터 데이터를 저장할 새로운 컨렉션을 생성합니다.
         컨렉션은 동일한 차원의 벡터들을 저장하는 컨테이너입니다.
-        
+
         Args:
             collection_name (str): 컨렉션 이름
             vector_size (Optional[int]): 벡터 차원 크기 (기본값: embedding_dim)
@@ -277,7 +284,7 @@ class QdrantRetriever(Retriever):
                 - COSINE: 코사인 유사도 (각도 기반)
                 - EUCLIDEAN: 유클리드 거리 (직선 거리)
                 - DOT: 내적 (Dot Product)
-            
+
         Raises:
             ConnectionError: 연결되지 않은 경우
             QueryError: 컨렉션 생성 실패 시
@@ -286,39 +293,31 @@ class QdrantRetriever(Retriever):
         """
         if not self._connected:
             raise ConnectionError("Not connected to Qdrant", "QdrantRetriever")
-        
+
         try:
             vector_size = vector_size or self.embedding_dim
-            
-            # Qdrant client create_collection is synchronous
-            self._client.create_collection(
+
+            # 클라이언트 획듍 및 컨렉션 생성
+            client = await self._client_manager.get_client()
+            client.create_collection(
                 collection_name=collection_name,
-                vectors_config=VectorParams(
-                    size=vector_size,
-                    distance=distance
-                )
+                vectors_config=VectorParams(size=vector_size, distance=distance),
             )
-            
+
             self._log_operation(
-                "create_collection",
-                collection=collection_name,
-                vector_size=vector_size
+                "create_collection", collection=collection_name, vector_size=vector_size
             )
-            
+
         except Exception as e:
             raise QueryError(f"Failed to create collection: {e}", "QdrantRetriever")
-    
-    async def upsert(
-        self,
-        collection: str,
-        documents: list[dict[str, Any]]
-    ) -> None:
+
+    async def upsert(self, collection: str, documents: list[dict[str, Any]]) -> None:
         """
         컨렉션에 문서 삽입 또는 업데이트
-        
+
         텍스트를 임베딩으로 변환한 후 Qdrant에 저장합니다.
         동일한 ID가 이미 존재하면 업데이트하고, 없으면 새로 삽입합니다.
-        
+
         Args:
             collection (str): 컨렉션 이름
             documents (list[dict[str, Any]]): 문서 리스트
@@ -326,7 +325,7 @@ class QdrantRetriever(Retriever):
                 - id (str/int): 문서 고유 ID
                 - text (str): 임베딩할 텍스트
                 - metadata (dict, 선택): 추가 메타데이터
-            
+
         Raises:
             ConnectionError: 연결되지 않은 경우
             QueryError: 업서트 실패 시
@@ -336,54 +335,41 @@ class QdrantRetriever(Retriever):
         """
         if not self._connected:
             raise ConnectionError("Not connected to Qdrant", "QdrantRetriever")
-        
+
         try:
             points = []
             for doc in documents:
                 # 텍스트를 임베딩으로 변환
                 vector = await self._embed_text(doc["text"])
-                
+
                 # Qdrant 포인트 생성
                 point = PointStruct(
                     id=doc["id"],
                     vector=vector,
-                    payload={
-                        "text": doc["text"],
-                        **doc.get("metadata", {})
-                    }
+                    payload={"text": doc["text"], **doc.get("metadata", {})},
                 )
                 points.append(point)
-            
-            # 배치 업서트 (효율성을 위해 한 번에 처리, Qdrant client method is synchronous)
-            self._client.upsert(
-                collection_name=collection,
-                points=points
-            )
-            
-            self._log_operation(
-                "upsert",
-                collection=collection,
-                count=len(documents)
-            )
-            
+
+            # 클라이언트 획듍 및 배치 업서트
+            client = await self._client_manager.get_client()
+            client.upsert(collection_name=collection, points=points)
+
+            self._log_operation("upsert", collection=collection, count=len(documents))
+
         except Exception as e:
             raise QueryError(f"Failed to upsert documents: {e}", "QdrantRetriever")
-    
-    async def delete(
-        self,
-        collection: str,
-        ids: list[str]
-    ) -> None:
+
+    async def delete(self, collection: str, ids: list[str]) -> None:
         """
         ID로 벡터 삭제
-        
+
         지정된 ID의 벡터들을 컨렉션에서 삭제합니다.
         삭제는 즉시 적용되며 복구할 수 없습니다.
-        
+
         Args:
             collection (str): 컨렉션 이름
             ids (list[str]): 삭제할 벡터 ID 리스트
-            
+
         Raises:
             ConnectionError: 연결되지 않은 경우
             QueryError: 삭제 실패 시
@@ -392,51 +378,44 @@ class QdrantRetriever(Retriever):
         """
         if not self._connected:
             raise ConnectionError("Not connected to Qdrant", "QdrantRetriever")
-        
+
         try:
-            # Qdrant client delete is synchronous
-            self._client.delete(
-                collection_name=collection,
-                points_selector=ids
-            )
-            
-            self._log_operation(
-                "delete",
-                collection=collection,
-                count=len(ids)
-            )
-            
+            # 클라이언트 획듍 및 삭제
+            client = await self._client_manager.get_client()
+            client.delete(collection_name=collection, points_selector=ids)
+
+            self._log_operation("delete", collection=collection, count=len(ids))
+
         except Exception as e:
             raise QueryError(f"Failed to delete vectors: {e}", "QdrantRetriever")
-    
+
     async def _test_connection(self) -> None:
         """
         Qdrant 연결 테스트
-        
+
         컨렉션 목록을 조회하여 연결 상태를 확인합니다.
-        
+
         Raises:
             Exception: 연결 테스트 실패 시
         """
-        if not self._client:
-            raise Exception("Client not initialized")
-        
-        # 컨렉션 목록 조회로 연결 확인 (Qdrant client method is synchronous)
-        self._client.get_collections()
-    
+        # 클라이언트 획듍 및 컨렉션 목록 조회로 연결 확인
+        client = await self._client_manager.get_client()
+        client.get_collections()
+
     def _create_embedding_function(self) -> Callable:
         """
         텍스트 임베딩 함수 생성
-        
+
         텍스트를 벡터로 변환하는 함수를 생성합니다.
         실제 구현에서는 OpenAI, Cohere, HuggingFace 등의
         임베딩 API를 사용해야 합니다.
-        
+
         Returns:
             Callable: 텍스트를 임베딩으로 변환하는 비동기 함수
                 - 입력: 텍스트 문자열
                 - 출력: 임베딩 벡터 (실수 리스트)
         """
+
         # 플레이스홀더 - 실제 구현에서는 실제 임베딩 서비스 사용
         async def embed_text(text: str) -> list[float]:
             # 임베딩 생성 시뮤레이션
@@ -444,22 +423,22 @@ class QdrantRetriever(Retriever):
             # - OpenAI: openai.embeddings.create(model="text-embedding-ada-002", input=text)
             # - Cohere: cohere.embed(texts=[text], model="embed-english-v3.0")
             return [0.0] * self.embedding_dim
-        
+
         return embed_text
-    
+
     def _format_result(self, result: Any) -> QueryResult:
         """
         Qdrant 검색 결과를 표준 형식으로 변환
-        
+
         Qdrant의 결과 형식을 MCP 서버의 표준 결과 형식으로
         변환합니다. 모든 리트리버가 동일한 형식을 사용하도록 합니다.
-        
+
         Args:
             result: Qdrant 검색 결과 객체
                 - id: 벡터 ID
                 - score: 유사도 점수
                 - payload: 메타데이터
-            
+
         Returns:
             QueryResult: 표준화된 결과 딕셔너리
                 - id: 결과 ID
@@ -469,12 +448,12 @@ class QdrantRetriever(Retriever):
                 - 기타 메타데이터 필드
         """
         payload = result.payload or {}
-        
+
         return {
             "id": str(result.id),
             "score": float(result.score),
             "text": payload.get("text", ""),
             "source": "qdrant",
             # text 필드를 제외한 모든 payload 필드 포함
-            **{k: v for k, v in payload.items() if k != "text"}
+            **{k: v for k, v in payload.items() if k != "text"},
         }

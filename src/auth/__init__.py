@@ -11,6 +11,4 @@ MCP 서버용 JWT 기반 인증 모듈
     - services: 비즈니스 로직 서비스 (인증, JWT, RBAC, MCP 프록시)
     - dependencies: FastAPI 의존성 주입 함수
     - server: JWT 기반 인증 게이트웨이 서버
-
-작성일: 2024-01-30
 """

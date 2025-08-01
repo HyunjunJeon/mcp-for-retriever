@@ -34,6 +34,7 @@ dependencies = [
     "opentelemetry-exporter-prometheus>=0.50b0",
     "sentry-sdk[fastapi]>=2.19.0",
     "python-fasthtml>=0.12.22",
+    "pyjwt>=2.10.1",
 ]
 
 [dependency-groups]
@@ -46,6 +47,9 @@ dev = [
     "pytest-mock>=3.14.0",
     "pytest-playwright>=0.5.2",
     "playwright>=1.49.0",
+    "pytest-benchmark>=5.0.0",
+    "memory-profiler>=0.61.0",
+    "psutil>=6.1.0",
 ]
 
 [tool.pytest.ini_options]
@@ -56,6 +60,17 @@ python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 addopts = "-v --tb=short"
+markers = [
+    "benchmark: marks tests as benchmark tests",
+    "integration: marks tests as integration tests",
+]
+
+[tool.pytest.benchmark]
+min_rounds = 5
+warmup = true
+warmup_iterations = 1
+disable_gc = true
+sort = "min"
 
 [tool.coverage.run]
 source = ["src"]

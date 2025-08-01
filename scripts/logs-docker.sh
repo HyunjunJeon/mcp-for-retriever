@@ -1,58 +1,73 @@
 #!/bin/bash
 
-# MCP Retriever Docker Compose 로그 확인 스크립트
+# Docker 컨테이너 로그 확인 스크립트
 
-set -e
+# 색상 정의
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
 
-# 스크립트가 실행되는 디렉토리로 이동
-SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-cd "$SCRIPT_DIR/.."
-
-# Docker Compose 파일 선택
-COMPOSE_FILE="docker-compose.local.yml"
-if [ ! -f "$COMPOSE_FILE" ]; then
-    COMPOSE_FILE="docker-compose.yml"
-fi
-
-# 서비스 이름 (첫 번째 인수)
-SERVICE=$1
+# 사용법 출력
+usage() {
+    echo "사용법: $0 [서비스명] [옵션]"
+    echo ""
+    echo "서비스명:"
+    echo "  auth-gateway  - Auth Gateway 로그"
+    echo "  mcp-server    - MCP Server 로그"
+    echo "  postgres      - PostgreSQL 로그"
+    echo "  qdrant        - Qdrant 로그"
+    echo "  redis         - Redis 로그"
+    echo "  (생략 시 모든 서비스 로그 표시)"
+    echo ""
+    echo "옵션:"
+    echo "  -f, --follow  실시간 로그 표시"
+    echo "  -n <숫자>     표시할 로그 라인 수 (기본값: 100)"
+    echo ""
+    echo "예시:"
+    echo "  $0                    # 모든 서비스 로그"
+    echo "  $0 mcp-server -f      # MCP Server 실시간 로그"
+    echo "  $0 auth-gateway -n 50 # Auth Gateway 최근 50줄"
+    exit 0
+}
 
 # 옵션 파싱
+SERVICE=""
 FOLLOW=""
-TAIL="100"
+LINES="100"
 
-shift # 첫 번째 인수 제거
-
-while [[ "$#" -gt 0 ]]; do
+while [[ $# -gt 0 ]]; do
     case $1 in
-        -f|--follow) FOLLOW="-f"; shift ;;
-        -n|--tail) TAIL="$2"; shift 2 ;;
-        --help) 
-            echo "사용법: $0 [서비스명] [옵션]"
-            echo ""
-            echo "서비스명:"
-            echo "  postgres      : PostgreSQL 데이터베이스"
-            echo "  qdrant        : Qdrant 벡터 데이터베이스"
-            echo "  redis         : Redis 캐시"
-            echo "  auth-gateway  : 인증 게이트웨이"
-            echo "  mcp-server    : MCP 서버"
-            echo "  (비어있음)     : 모든 서비스"
-            echo ""
-            echo "옵션:"
-            echo "  -f, --follow     : 실시간 로그 추적"
-            echo "  -n, --tail <줄수> : 마지막 N줄만 표시 (기본값: 100)"
-            echo "  --help           : 이 도움말을 표시합니다"
-            exit 0
+        -h|--help)
+            usage
             ;;
-        *) echo "알 수 없는 옵션: $1"; exit 1 ;;
+        -f|--follow)
+            FOLLOW="--follow"
+            shift
+            ;;
+        -n)
+            LINES="$2"
+            shift 2
+            ;;
+        *)
+            if [ -z "$SERVICE" ]; then
+                SERVICE="$1"
+            fi
+            shift
+            ;;
     esac
 done
 
+# docker-compose.yml이 있는 디렉토리로 이동
+cd "$(dirname "$0")/.."
+
 # 로그 표시
 if [ -z "$SERVICE" ]; then
-    echo "📜 모든 서비스 로그 (마지막 $TAIL 줄)"
-    docker-compose -f "$COMPOSE_FILE" logs --tail="$TAIL" $FOLLOW
+    echo -e "${BLUE}📋 모든 서비스 로그 (최근 ${LINES}줄)${NC}"
+    echo "================================"
+    docker-compose logs --tail="$LINES" $FOLLOW
 else
-    echo "📜 $SERVICE 서비스 로그 (마지막 $TAIL 줄)"
-    docker-compose -f "$COMPOSE_FILE" logs --tail="$TAIL" $FOLLOW "$SERVICE"
+    echo -e "${BLUE}📋 ${SERVICE} 로그 (최근 ${LINES}줄)${NC}"
+    echo "================================"
+    docker-compose logs --tail="$LINES" $FOLLOW "$SERVICE"
 fi

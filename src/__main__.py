@@ -9,9 +9,9 @@ from src.server_auth import mcp
 if __name__ == "__main__":
     transport = os.getenv("MCP_TRANSPORT", "stdio")
     port = int(os.getenv("MCP_SERVER_PORT", "8001"))
-    
+
     print(f"Starting MCP server with authentication (transport: {transport})...")
-    
+
     if transport == "http":
         print(f"HTTP server listening on port {port}...")
         mcp.run(transport="http", port=port)

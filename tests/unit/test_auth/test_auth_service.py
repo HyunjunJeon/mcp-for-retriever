@@ -1,6 +1,5 @@
 """사용자 인증 서비스 테스트"""
 
-from typing import Any
 from unittest.mock import AsyncMock, Mock
 
 import pytest
@@ -61,7 +60,7 @@ class TestAuthService:
             password=SecretStr("StrongPassword123!"),
             roles=["user"],
         )
-        
+
         created_user = User(
             id="new-user-123",
             email=user_create.email,
@@ -69,7 +68,7 @@ class TestAuthService:
             is_active=True,
             roles=user_create.roles,
         )
-        
+
         mock_user_repository.get_by_email = AsyncMock(return_value=None)
         mock_user_repository.create = AsyncMock(return_value=created_user)
 
@@ -81,7 +80,7 @@ class TestAuthService:
         assert result.email == created_user.email
         assert result.roles == created_user.roles
         assert result.is_active is True
-        
+
         # 비밀번호가 해시되었는지 확인
         mock_user_repository.create.assert_called_once()
         call_args = mock_user_repository.create.call_args[0][0]
@@ -102,13 +101,13 @@ class TestAuthService:
             password=SecretStr("Password123!"),
             roles=["user"],
         )
-        
+
         mock_user_repository.get_by_email = AsyncMock(return_value=sample_user)
 
         # When & Then
         with pytest.raises(AuthenticationError) as exc_info:
             await auth_service.register(user_create)
-        
+
         assert "이미 등록된 이메일" in str(exc_info.value)
 
     @pytest.mark.asyncio
@@ -125,11 +124,11 @@ class TestAuthService:
             email="test@example.com",
             password=SecretStr("CorrectPassword123!"),
         )
-        
+
         mock_user_repository.get_by_email = AsyncMock(return_value=sample_user)
         mock_jwt_service.create_access_token.return_value = "access_token_123"
         mock_jwt_service.create_refresh_token.return_value = "refresh_token_123"
-        
+
         # 비밀번호 검증을 위해 verify_password 메서드 mock
         auth_service.verify_password = Mock(return_value=True)
 
@@ -141,7 +140,7 @@ class TestAuthService:
         assert tokens.access_token == "access_token_123"
         assert tokens.refresh_token == "refresh_token_123"
         assert tokens.token_type == "Bearer"
-        
+
         mock_jwt_service.create_access_token.assert_called_once_with(
             user_id=sample_user.id,
             email=sample_user.email,
@@ -163,13 +162,13 @@ class TestAuthService:
             email="notfound@example.com",
             password=SecretStr("Password123!"),
         )
-        
+
         mock_user_repository.get_by_email = AsyncMock(return_value=None)
 
         # When & Then
         with pytest.raises(AuthenticationError) as exc_info:
             await auth_service.login(user_login)
-        
+
         assert "이메일 또는 비밀번호가 올바르지 않습니다" in str(exc_info.value)
 
     @pytest.mark.asyncio
@@ -185,14 +184,14 @@ class TestAuthService:
             email="test@example.com",
             password=SecretStr("WrongPassword123!"),
         )
-        
+
         mock_user_repository.get_by_email = AsyncMock(return_value=sample_user)
         auth_service.verify_password = Mock(return_value=False)
 
         # When & Then
         with pytest.raises(AuthenticationError) as exc_info:
             await auth_service.login(user_login)
-        
+
         assert "이메일 또는 비밀번호가 올바르지 않습니다" in str(exc_info.value)
 
     @pytest.mark.asyncio
@@ -204,21 +203,19 @@ class TestAuthService:
     ) -> None:
         """비활성화된 사용자로 로그인 시도 테스트"""
         # Given
-        inactive_user = User(
-            **{**sample_user.model_dump(), "is_active": False}
-        )
+        inactive_user = User(**{**sample_user.model_dump(), "is_active": False})
         user_login = UserLogin(
             email="test@example.com",
             password=SecretStr("CorrectPassword123!"),
         )
-        
+
         mock_user_repository.get_by_email = AsyncMock(return_value=inactive_user)
         auth_service.verify_password = Mock(return_value=True)
 
         # When & Then
         with pytest.raises(AuthenticationError) as exc_info:
             await auth_service.login(user_login)
-        
+
         assert "계정이 비활성화되었습니다" in str(exc_info.value)
 
     @pytest.mark.asyncio
@@ -232,7 +229,7 @@ class TestAuthService:
         """토큰 갱신 성공 테스트"""
         # Given
         refresh_token = "valid_refresh_token"
-        
+
         mock_user_repository.get_by_id = AsyncMock(return_value=sample_user)
         mock_jwt_service.refresh_access_token.return_value = "new_access_token"
         mock_jwt_service.decode_token.return_value = Mock(
@@ -248,7 +245,7 @@ class TestAuthService:
         assert new_tokens.access_token == "new_access_token"
         assert new_tokens.refresh_token == refresh_token
         assert new_tokens.token_type == "Bearer"
-        
+
         mock_jwt_service.refresh_access_token.assert_called_once_with(
             refresh_token=refresh_token,
             email=sample_user.email,
@@ -269,7 +266,7 @@ class TestAuthService:
         # When & Then
         with pytest.raises(AuthenticationError) as exc_info:
             await auth_service.refresh_tokens(refresh_token)
-        
+
         assert "유효하지 않은 리프레시 토큰" in str(exc_info.value)
 
     @pytest.mark.asyncio
@@ -282,7 +279,7 @@ class TestAuthService:
         """존재하지 않는 사용자의 토큰 갱신 시도 테스트"""
         # Given
         refresh_token = "valid_refresh_token"
-        
+
         mock_jwt_service.decode_token.return_value = Mock(
             user_id="non-existent-user",
             token_type="refresh",
@@ -292,7 +289,7 @@ class TestAuthService:
         # When & Then
         with pytest.raises(AuthenticationError) as exc_info:
             await auth_service.refresh_tokens(refresh_token)
-        
+
         assert "사용자를 찾을 수 없습니다" in str(exc_info.value)
 
     def test_hash_password(self, auth_service: AuthService) -> None:

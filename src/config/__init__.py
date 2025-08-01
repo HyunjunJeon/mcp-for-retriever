@@ -16,6 +16,6 @@ from .validators import validate_config
 
 __all__ = [
     "ServerConfig",
-    "ServerProfile", 
+    "ServerProfile",
     "validate_config",
 ]
