@@ -71,13 +71,30 @@ API 엔드포인트:
     ```
 """
 
+import csv
+import io
+import json
+import asyncio
+from datetime import datetime
 from contextlib import asynccontextmanager
-from typing import Annotated, Optional
+from typing import Annotated, Optional, AsyncGenerator
+from collections import deque
+
+# 재사용 가능한 컴포넌트 import
+from .components import (
+    AdminTable, AdminModal, AdminForm, StatsCard, 
+    FilterBar, AdminCard, AdminBreadcrumb, LoadingSpinner,
+    AnalyticsChart, ExportButton, MetricsTable, NotificationBanner,
+    LanguageSelector
+)
+# 번역 시스템 import
+from .translations import T, get_user_language, set_user_language, SUPPORTED_LANGUAGES
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from fastapi import FastAPI, Depends, HTTPException, status, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.responses import JSONResponse, HTMLResponse, StreamingResponse
+from sse_starlette import EventSourceResponse
 from fasthtml.common import (
     Div,
     P,
@@ -98,6 +115,8 @@ from fasthtml.common import (
     Title,
     Meta,
     Link,
+    Canvas,
+    Span,
     Nav,
     Label,
     Select,
@@ -240,36 +259,8 @@ async def lifespan(app: FastAPI):
 
     # 초기 관리자 계정 생성
     try:
-        async with async_session_maker() as session:
-            repository = SQLiteUserRepository(session)
-
-            # 관리자 계정이 이미 있는지 확인
-            admin_email = "admin@example.com"
-            existing_admin = await repository.get_by_email(admin_email)
-
-            if not existing_admin:
-                # JWT 서비스 생성
-                jwt_secret = os.getenv(
-                    "JWT_SECRET_KEY", "your-secret-key-change-in-production"
-                )
-                jwt_service = JWTService(secret_key=jwt_secret)
-
-                # Auth 서비스 생성
-                auth_service = SQLiteAuthService(jwt_service)
-
-                # 관리자 계정 생성
-                admin_data = UserCreate(
-                    email=admin_email,
-                    password="Admin123!",
-                    username="admin",
-                    roles=["admin", "user"],
-                )
-
-                await auth_service.register(admin_data, session)
-                logger.info("초기 관리자 계정 생성 완료", email=admin_email)
-            else:
-                logger.info("관리자 계정이 이미 존재합니다", email=admin_email)
-
+        from .init_admin import init_admin_on_startup
+        await init_admin_on_startup()
     except Exception as e:
         logger.error("초기 관리자 계정 생성 실패", error=str(e))
 
@@ -287,6 +278,54 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+# SSE (Server-Sent Events) 이벤트 관리
+event_queue: deque = deque(maxlen=100)  # 최대 100개 이벤트 유지
+active_connections: set = set()  # 활성 SSE 연결 추적
+
+def send_notification(type: str, message: str, title: Optional[str] = None, **kwargs):
+    """실시간 알림 이벤트 발송"""
+    event_data = {
+        "type": type,  # "success", "warning", "error", "info"
+        "message": message,
+        "title": title,
+        "timestamp": datetime.utcnow().isoformat(),
+        **kwargs
+    }
+    
+    # 이벤트 큐에 추가
+    event_queue.append(event_data)
+    logger.info(f"SSE 알림 발송: {type} - {message}")
+
+def send_user_event(event_type: str, user_data: dict):
+    """사용자 관련 이벤트 발송"""
+    send_notification(
+        type="info",
+        message=f"새 사용자가 등록되었습니다: {user_data.get('email', 'Unknown')}",
+        title="사용자 등록",
+        event_type=event_type,
+        user_data=user_data
+    )
+
+def send_permission_event(event_type: str, permission_data: dict):
+    """권한 변경 이벤트 발송"""
+    send_notification(
+        type="warning",
+        message=f"권한이 변경되었습니다: {permission_data.get('resource_type', 'Unknown')}",
+        title="권한 변경",
+        event_type=event_type,
+        permission_data=permission_data
+    )
+
+def send_system_error(error_msg: str, error_details: Optional[dict] = None):
+    """시스템 오류 이벤트 발송"""
+    send_notification(
+        type="error",
+        message=f"시스템 오류 발생: {error_msg}",
+        title="시스템 오류",
+        event_type="system_error",
+        error_details=error_details
+    )
 
 # CORS 설정
 app.add_middleware(
@@ -339,6 +378,15 @@ async def register(
     try:
         user = await auth_service.register(user_create, db)
         logger.info("사용자 등록 성공", email=user.email)
+        
+        # SSE 알림 발송
+        send_user_event("user_registered", {
+            "email": user.email,
+            "username": user.username,
+            "id": user.id,
+            "roles": user.roles
+        })
+        
         return user
     except AuthenticationError as e:
         logger.warning("사용자 등록 실패", error=str(e))
@@ -594,6 +642,7 @@ async def login_page():
             .success { color: green; margin-top: 10px; }
             .token-info { background-color: #f8f9fa; padding: 15px; border-radius: 4px; margin-top: 20px; word-break: break-all; }
         </style>
+        <script src="https://unpkg.com/htmx.org@1.9.12"></script>
     </head>
     <body>
         <h1>MCP 로그인</h1>
@@ -617,7 +666,11 @@ async def login_page():
                 <strong>Refresh Token:</strong>
                 <p id="refreshToken"></p>
             </div>
-            <button onclick="testAuthMe()">현재 사용자 정보 조회</button>
+            <button 
+                hx-get="/auth/test-me" 
+                hx-target="#message"
+                hx-headers='{"Authorization": "Bearer " + (currentAccessToken || "")}'
+                class="btn-primary">현재 사용자 정보 조회</button>
         </div>
         <p>계정이 없으신가요? <a href="/auth/register-page">회원가입</a></p>
         
@@ -672,30 +725,7 @@ async def login_page():
                     tokenInfoDiv.style.display = 'none';
                 }
             });
-            
-            async function testAuthMe() {
-                const messageDiv = document.getElementById('message');
-                
-                if (!currentAccessToken) {
-                    messageDiv.innerHTML = '<p class="error">먼저 로그인하세요.</p>';
-                    return;
-                }
-                
-                try {
-                    const response = await fetch('/auth/me', {
-                        headers: { 'Authorization': `Bearer ${currentAccessToken}` }
-                    });
-                    
-                    if (response.ok) {
-                        const userData = await response.json();
-                        messageDiv.innerHTML = `<p class="success">사용자 정보: ${JSON.stringify(userData, null, 2)}</p>`;
-                    } else {
-                        messageDiv.innerHTML = '<p class="error">인증 실패: 토큰이 유효하지 않습니다.</p>';
-                    }
-                } catch (error) {
-                    messageDiv.innerHTML = '<p class="error">네트워크 오류가 발생했습니다.</p>';
-                }
-            }
+
         </script>
     </body>
     </html>
@@ -841,6 +871,16 @@ async def create_resource_permission(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="권한 생성 후 조회에 실패했습니다",
             )
+
+        # SSE 권한 변경 알림 발송
+        send_permission_event("permission_created", {
+            "resource_type": permission_data.resource_type.value,
+            "resource_name": permission_data.resource_name,
+            "actions": permission_data.actions,
+            "user_id": permission_data.user_id,
+            "role_name": permission_data.role_name,
+            "granted_by": current_user.email
+        })
 
         return ResourcePermissionResponse(
             id=row["id"],
@@ -1677,7 +1717,7 @@ async def admin_sessions_page(
     auth_service: Annotated[SQLiteAuthService, Depends(get_sqlite_auth_service)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
-    """세션 관리 페이지"""
+    """세션 관리 페이지 (HTMX 기반)"""
     try:
         # 모든 활성 세션 조회
         all_sessions = []
@@ -1742,28 +1782,41 @@ async def admin_sessions_page(
                 ),
                 cls="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8",
             ),
-            # 사용자별 세션 검색
+            # 사용자별 세션 검색 (HTMX 기반)
             Div(
                 H2("사용자 세션 검색", cls="text-xl font-semibold text-gray-900 mb-4"),
                 Form(
                     Div(
                         Input(
                             type="text",
-                            id="userSearchInput",
+                            name="query",
                             placeholder="사용자 ID 또는 이메일로 검색",
                             cls="flex-1 px-4 py-2 border border-gray-300 rounded-l-lg focus:outline-none focus:ring-2 focus:ring-blue-500",
+                            **{
+                                "hx-get": "/admin/sessions/search",
+                                "hx-target": "#userSessionsResult",
+                                "hx-trigger": "keyup changed delay:500ms, search",
+                            }
                         ),
                         Button(
                             "검색",
-                            type="button",
-                            onclick="searchUserSessions()",
+                            type="submit",
                             cls="bg-blue-500 hover:bg-blue-600 text-white font-medium py-2 px-6 rounded-r-lg",
                         ),
                         cls="flex",
                     ),
+                    **{
+                        "hx-get": "/admin/sessions/search",
+                        "hx-target": "#userSessionsResult",
+                        "hx-trigger": "submit",
+                    },
                     cls="mb-4",
                 ),
-                Div(id="userSessionsResult", cls="mt-4"),
+                Div(
+                    # 검색 결과가 여기에 로드됩니다
+                    id="userSessionsResult", 
+                    cls="mt-4"
+                ),
                 cls="bg-white rounded-lg shadow-md p-6 mb-8",
             ),
             # 전체 활성 세션 목록
@@ -1847,7 +1900,12 @@ async def admin_sessions_page(
                                     Td(
                                         Button(
                                             "무효화",
-                                            onclick=f"revokeToken('{session.get('jti', '')}', '{session.get('user_email', '')}')",
+                                            **{
+                                                "hx-post": f"/admin/sessions/revoke/{session.get('jti', '')}",
+                                                "hx-confirm": f"{session.get('user_email', '')}의 토큰을 무효화하시겠습니까?",
+                                                "hx-target": "closest tr",
+                                                "hx-swap": "outerHTML",
+                                            },
                                             cls="bg-red-500 hover:bg-red-600 text-white font-medium py-1 px-3 rounded text-sm",
                                         ),
                                         cls="px-6 py-4 whitespace-nowrap",
@@ -1868,145 +1926,6 @@ async def admin_sessions_page(
                 else "",
                 cls="bg-white rounded-lg shadow-md overflow-hidden",
             ),
-            # JavaScript 함수들
-            Script("""
-                async function searchUserSessions() {
-                    const searchValue = document.getElementById('userSearchInput').value.trim();
-                    const resultDiv = document.getElementById('userSessionsResult');
-                    
-                    if (!searchValue) {
-                        resultDiv.innerHTML = '<p class="text-red-500">검색어를 입력하세요.</p>';
-                        return;
-                    }
-                    
-                    try {
-                        // 사용자 검색
-                        const userResponse = await fetch(`/api/v1/users/search?query=${encodeURIComponent(searchValue)}`, {
-                            headers: {
-                                'Authorization': 'Bearer ' + localStorage.getItem('access_token')
-                            }
-                        });
-                        
-                        if (!userResponse.ok) {
-                            resultDiv.innerHTML = '<p class="text-red-500">사용자를 찾을 수 없습니다.</p>';
-                            return;
-                        }
-                        
-                        const users = await userResponse.json();
-                        if (users.length === 0) {
-                            resultDiv.innerHTML = '<p class="text-red-500">사용자를 찾을 수 없습니다.</p>';
-                            return;
-                        }
-                        
-                        const user = users[0];
-                        
-                        // 사용자 세션 조회
-                        const sessionsResponse = await fetch(`/api/v1/admin/users/${user.id}/sessions`, {
-                            headers: {
-                                'Authorization': 'Bearer ' + localStorage.getItem('access_token')
-                            }
-                        });
-                        
-                        if (sessionsResponse.ok) {
-                            const sessions = await sessionsResponse.json();
-                            
-                            let html = `
-                                <div class="border-t pt-4">
-                                    <h3 class="font-semibold text-lg mb-2">${user.email} (${user.username || 'No username'})</h3>
-                                    <p class="text-sm text-gray-600 mb-4">활성 세션: ${sessions.length}개</p>
-                            `;
-                            
-                            if (sessions.length > 0) {
-                                html += `
-                                    <div class="space-y-2">
-                                        ${sessions.map(s => `
-                                            <div class="bg-gray-50 p-3 rounded flex justify-between items-center">
-                                                <div>
-                                                    <p class="text-sm font-mono">${(s.jti || '-').substring(0, 12)}...</p>
-                                                    <p class="text-xs text-gray-500">만료: ${s.expires_at ? new Date(s.expires_at).toLocaleString() : '-'}</p>
-                                                </div>
-                                                <button onclick="revokeToken('${s.jti}', '${user.email}')" class="bg-red-500 hover:bg-red-600 text-white text-sm px-3 py-1 rounded">
-                                                    무효화
-                                                </button>
-                                            </div>
-                                        `).join('')}
-                                    </div>
-                                    <button onclick="revokeAllUserTokens('${user.id}', '${user.email}')" class="mt-4 bg-red-600 hover:bg-red-700 text-white font-medium px-4 py-2 rounded">
-                                        모든 세션 무효화
-                                    </button>
-                                `;
-                            } else {
-                                html += '<p class="text-gray-500">활성 세션이 없습니다.</p>';
-                            }
-                            
-                            html += '</div>';
-                            resultDiv.innerHTML = html;
-                        }
-                    } catch (error) {
-                        resultDiv.innerHTML = `<p class="text-red-500">오류가 발생했습니다: ${error.message}</p>`;
-                    }
-                }
-                
-                async function revokeToken(jti, userEmail) {
-                    if (!confirm(`${userEmail}의 토큰을 무효화하시겠습니까?`)) {
-                        return;
-                    }
-                    
-                    try {
-                        const response = await fetch(`/api/v1/admin/tokens/revoke/${jti}`, {
-                            method: 'POST',
-                            headers: {
-                                'Authorization': 'Bearer ' + localStorage.getItem('access_token')
-                            }
-                        });
-                        
-                        const result = await response.json();
-                        
-                        if (response.ok && result.success) {
-                            alert('토큰이 무효화되었습니다.');
-                            location.reload();
-                        } else {
-                            alert(result.message || '토큰 무효화 실패');
-                        }
-                    } catch (error) {
-                        alert('오류가 발생했습니다: ' + error.message);
-                    }
-                }
-                
-                async function revokeAllUserTokens(userId, userEmail) {
-                    if (!confirm(`${userEmail}의 모든 세션을 무효화하시겠습니까?\n이 사용자는 모든 디바이스에서 로그아웃됩니다.`)) {
-                        return;
-                    }
-                    
-                    try {
-                        const response = await fetch(`/api/v1/admin/users/${userId}/revoke-tokens`, {
-                            method: 'POST',
-                            headers: {
-                                'Authorization': 'Bearer ' + localStorage.getItem('access_token')
-                            }
-                        });
-                        
-                        const result = await response.json();
-                        
-                        if (response.ok && result.success) {
-                            alert(result.message || '모든 토큰이 무효화되었습니다.');
-                            location.reload();
-                        } else {
-                            alert(result.message || '토큰 무효화 실패');
-                        }
-                    } catch (error) {
-                        alert('오류가 발생했습니다: ' + error.message);
-                    }
-                }
-                
-                // Enter 키로 검색
-                document.getElementById('userSearchInput').addEventListener('keypress', function(e) {
-                    if (e.key === 'Enter') {
-                        e.preventDefault();
-                        searchUserSessions();
-                    }
-                });
-            """),
         )
 
         return create_layout("세션 관리", content, current_user)
@@ -2016,6 +1935,169 @@ async def admin_sessions_page(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="세션 관리 페이지를 로드하는 중 오류가 발생했습니다",
+        )
+
+# === HTMX 엔드포인트: 세션 관리 기능들 ===
+
+@app.get("/admin/sessions/search", response_class=HTMLResponse)
+async def search_user_sessions_htmx(
+    query: str,
+    current_user: Annotated[UserResponse, Depends(require_admin)],
+    auth_service: Annotated[SQLiteAuthService, Depends(get_sqlite_auth_service)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    """HTMX: 사용자 세션 검색"""
+    try:
+        if not query.strip():
+            return HTMLResponse(
+                content='<p class="text-red-500">검색어를 입력하세요.</p>'
+            )
+
+        # 사용자 검색
+        from .repositories.sqlite_user_repository import SQLiteUserRepository
+        repository = SQLiteUserRepository(db)
+        
+        # ID로 검색을 시도하고, 실패하면 이메일로 검색
+        users = []
+        try:
+            if query.isdigit():
+                user = await repository.get_by_id(int(query))
+                if user:
+                    users = [user]
+        except:
+            pass
+        
+        if not users:
+            # 이메일로 검색
+            all_users = await repository.list_all(limit=100)
+            users = [u for u in all_users if query.lower() in u.email.lower()]
+
+        if not users:
+            return HTMLResponse(
+                content='<p class="text-red-500">사용자를 찾을 수 없습니다.</p>'
+            )
+
+        user = users[0]
+        
+        # 사용자 세션 조회
+        sessions = await auth_service.jwt_service.get_active_sessions(user.id)
+        
+        # 결과 HTML 생성
+        content_parts = [
+            f'<div class="border-t pt-4">',
+            f'<h3 class="font-semibold text-lg mb-2">{user.email} ({user.username or "No username"})</h3>',
+            f'<p class="text-sm text-gray-600 mb-4">활성 세션: {len(sessions)}개</p>'
+        ]
+        
+        if sessions:
+            content_parts.append('<div class="space-y-2">')
+            for session in sessions:
+                jti = session.get("jti", "")
+                expires_at = session.get("expires_at", "")
+                expires_display = expires_at.replace("T", " ")[:19] if expires_at else "-"
+                
+                content_parts.append(
+                    f'<div class="bg-gray-50 p-3 rounded flex justify-between items-center">'
+                    f'<div>'
+                    f'<p class="text-sm font-mono">{jti[:12]}...</p>'
+                    f'<p class="text-xs text-gray-500">만료: {expires_display}</p>'
+                    f'</div>'
+                    f'<button hx-post="/admin/sessions/revoke/{jti}" '
+                    f'hx-confirm="정말로 이 토큰을 무효화하시겠습니까?" '
+                    f'hx-target="#userSessionsResult" '
+                    f'hx-vals=\'{{"user_email": "{user.email}"}}\' '
+                    f'class="bg-red-500 hover:bg-red-600 text-white text-sm px-3 py-1 rounded">'
+                    f'무효화'
+                    f'</button>'
+                    f'</div>'
+                )
+            
+            content_parts.append('</div>')
+            content_parts.append(
+                f'<button hx-post="/admin/sessions/revoke-all/{user.id}" '
+                f'hx-confirm="정말로 {user.email}의 모든 세션을 무효화하시겠습니까?\\n이 사용자는 모든 디바이스에서 로그아웃됩니다." '
+                f'hx-target="#userSessionsResult" '
+                f'hx-vals=\'{{"user_email": "{user.email}"}}\' '
+                f'class="mt-4 bg-red-600 hover:bg-red-700 text-white font-medium px-4 py-2 rounded">'
+                f'모든 세션 무효화'
+                f'</button>'
+            )
+        else:
+            content_parts.append('<p class="text-gray-500">활성 세션이 없습니다.</p>')
+        
+        content_parts.append('</div>')
+        
+        return HTMLResponse(content="".join(content_parts))
+        
+    except Exception as e:
+        logger.error("사용자 세션 검색 오류", error=str(e))
+        return HTMLResponse(
+            content=f'<p class="text-red-500">오류가 발생했습니다: {str(e)}</p>'
+        )
+
+
+@app.post("/admin/sessions/revoke/{jti}", response_class=HTMLResponse)
+async def revoke_session_htmx(
+    jti: str,
+    request: Request,
+    current_user: Annotated[UserResponse, Depends(require_admin)],
+    auth_service: Annotated[SQLiteAuthService, Depends(get_sqlite_auth_service)],
+):
+    """HTMX: 개별 세션 무효화"""
+    try:
+        # 토큰 무효화
+        result = await auth_service.jwt_service.revoke_token(jti)
+        
+        if result:
+            # 성공 메시지와 함께 페이지 새로고침 트리거
+            return HTMLResponse(
+                content='<div class="text-green-600 p-3 bg-green-50 rounded mb-4">'
+                '토큰이 무효화되었습니다.'
+                '</div>'
+                
+                headers={"HX-Refresh": "true"}
+            )
+        else:
+            return HTMLResponse(
+                content='<div class="text-red-600 p-3 bg-red-50 rounded">'
+                '토큰 무효화에 실패했습니다.'
+                '</div>'
+            )
+    except Exception as e:
+        logger.error("토큰 무효화 오류", error=str(e), jti=jti)
+        return HTMLResponse(
+            content=f'<div class="text-red-600 p-3 bg-red-50 rounded">'
+            f'오류가 발생했습니다: {str(e)}'
+            f'</div>'
+        )
+
+
+@app.post("/admin/sessions/revoke-all/{user_id}", response_class=HTMLResponse)
+async def revoke_all_user_sessions_htmx(
+    user_id: str,
+    request: Request,
+    current_user: Annotated[UserResponse, Depends(require_admin)],
+    auth_service: Annotated[SQLiteAuthService, Depends(get_sqlite_auth_service)],
+):
+    """HTMX: 사용자의 모든 세션 무효화"""
+    try:
+        # 사용자의 모든 토큰 무효화
+        revoked_count = await auth_service.jwt_service.revoke_all_user_tokens(user_id)
+        
+        return HTMLResponse(
+            content=f'<div class="text-green-600 p-3 bg-green-50 rounded mb-4">'
+            f'{revoked_count}개의 토큰이 무효화되었습니다.'
+            '</div>'
+            
+            headers={"HX-Refresh": "true"}
+        )
+        
+    except Exception as e:
+        logger.error("사용자 토큰 전체 무효화 오류", error=str(e), user_id=user_id)
+        return HTMLResponse(
+            content=f'<div class="text-red-600 p-3 bg-red-50 rounded">'
+            f'오류가 발생했습니다: {str(e)}'
+            f'</div>'
         )
 
 
@@ -2056,8 +2138,687 @@ async def health_check():
 # === FastHTML 관리 웹 페이지 ===
 
 
-def create_layout(title: str, content, current_user=None):
-    """공통 레이아웃 템플릿"""
+# === Placeholder 기능 HTMX 엔드포인트 ===
+
+@app.get("/admin/placeholder/add-user", response_class=HTMLResponse)
+async def placeholder_add_user():
+    """사용자 추가 기능 준비 중 알림"""
+    return HTMLResponse(
+        content='<div class="text-blue-600 p-3 bg-blue-50 rounded mb-4">'
+        '사용자 추가 기능은 곧 구현될 예정입니다.'
+        '</div>'
+    )
+
+@app.get("/admin/export/users.csv")
+async def export_users_csv(
+    current_user: Annotated[UserResponse, Depends(require_admin)],
+    auth_service: Annotated[SQLiteAuthService, Depends(get_sqlite_auth_service)],
+    db: Annotated[AsyncSession, Depends(get_db)]
+):
+    """사용자 데이터를 CSV 형태로 내보내기"""
+    try:
+        logger.info("사용자 CSV 내보내기 시작", user_id=current_user.id)
+        
+        # 모든 사용자 데이터 조회
+        users = await auth_service.list_users(db)
+        
+        # CSV 스트림 생성
+        def generate_csv():
+            output = io.StringIO()
+            writer = csv.writer(output)
+            
+            # 헤더 작성
+            writer.writerow(['ID', '사용자명', '이메일', '역할', '활성화', '생성일', '최종로그인'])
+            yield output.getvalue()
+            output.seek(0)
+            output.truncate(0)
+            
+            # 데이터 행 작성
+            for user in users:
+                writer.writerow([
+                    user.id,
+                    user.username or '',
+                    user.email,
+                    ', '.join(user.roles) if user.roles else '',
+                    '예' if user.is_active else '아니오',
+                    user.created_at.strftime('%Y-%m-%d %H:%M:%S') if user.created_at else '',
+                    user.last_login.strftime('%Y-%m-%d %H:%M:%S') if user.last_login else ''
+                ])
+                yield output.getvalue()
+                output.seek(0)
+                output.truncate(0)
+        
+        logger.info("사용자 CSV 내보내기 완료", user_count=len(users))
+        
+        return StreamingResponse(
+            generate_csv(),
+            media_type="text/csv",
+            headers={"Content-Disposition": "attachment; filename=users.csv"}
+        )
+        
+    except Exception as e:
+        logger.error("사용자 CSV 내보내기 실패", error=str(e))
+        raise HTTPException(status_code=500, detail="내보내기 중 오류가 발생했습니다")
+
+@app.get("/admin/export/permissions.csv")
+async def export_permissions_csv(
+    current_user: Annotated[UserResponse, Depends(require_admin)],
+    permission_service=Depends(get_permission_service)
+):
+    """권한 데이터를 CSV 형태로 내보내기"""
+    try:
+        logger.info("권한 CSV 내보내기 시작", user_id=current_user.id)
+        
+        # 모든 권한 데이터 조회
+        permissions = await permission_service.list_permissions()
+        
+        # CSV 스트림 생성
+        def generate_csv():
+            output = io.StringIO()
+            writer = csv.writer(output)
+            
+            # 헤더 작성
+            writer.writerow(['ID', '사용자ID', '역할명', '리소스타입', '리소스명', '액션', '조건', '부여일', '만료일'])
+            yield output.getvalue()
+            output.seek(0)
+            output.truncate(0)
+            
+            # 데이터 행 작성
+            for permission in permissions:
+                writer.writerow([
+                    permission.id,
+                    permission.user_id or '',
+                    permission.role_name or '',
+                    permission.resource_type,
+                    permission.resource_name,
+                    ', '.join(permission.actions) if permission.actions else '',
+                    json.dumps(permission.conditions, ensure_ascii=False) if permission.conditions else '',
+                    permission.granted_at.strftime('%Y-%m-%d %H:%M:%S') if permission.granted_at else '',
+                    permission.expires_at.strftime('%Y-%m-%d %H:%M:%S') if permission.expires_at else ''
+                ])
+                yield output.getvalue()
+                output.seek(0)
+                output.truncate(0)
+        
+        logger.info("권한 CSV 내보내기 완료", permission_count=len(permissions))
+        
+        return StreamingResponse(
+            generate_csv(),
+            media_type="text/csv",
+            headers={"Content-Disposition": "attachment; filename=permissions.csv"}
+        )
+        
+    except Exception as e:
+        logger.error("권한 CSV 내보내기 실패", error=str(e))
+        raise HTTPException(status_code=500, detail="내보내기 중 오류가 발생했습니다")
+
+@app.get("/admin/export/metrics.json")
+async def export_metrics_json(
+    current_user: Annotated[UserResponse, Depends(require_admin)]
+):
+    """시스템 메트릭을 JSON 형태로 내보내기"""
+    try:
+        logger.info("메트릭 JSON 내보내기 시작", user_id=current_user.id)
+        
+        # 기본 시스템 메트릭 생성 (향후 MetricsMiddleware 통합 예정)
+        metrics_data = {
+            "export_timestamp": datetime.now().isoformat(),
+            "export_user": current_user.email,
+            "system_metrics": {
+                "total_requests": 0,
+                "error_rate": 0.0,
+                "avg_response_time_ms": 0.0
+            },
+            "tool_metrics": {
+                "search_web": {"count": 0, "avg_duration_ms": 0},
+                "search_vectors": {"count": 0, "avg_duration_ms": 0},
+                "search_database": {"count": 0, "avg_duration_ms": 0},
+                "health_check": {"count": 0, "avg_duration_ms": 0}
+            },
+            "user_metrics": {
+                "active_users": 0,
+                "total_sessions": 0,
+                "avg_requests_per_user": 0.0
+            },
+            "note": "메트릭 수집 시스템 통합 예정"
+        }
+        
+        # JSON 스트림 생성
+        def generate_json():
+            json_str = json.dumps(metrics_data, ensure_ascii=False, indent=2)
+            yield json_str
+        
+        logger.info("메트릭 JSON 내보내기 완료")
+        
+        return StreamingResponse(
+            generate_json(),
+            media_type="application/json",
+            headers={"Content-Disposition": "attachment; filename=metrics.json"}
+        )
+        
+    except Exception as e:
+        logger.error("메트릭 JSON 내보내기 실패", error=str(e))
+        raise HTTPException(status_code=500, detail="내보내기 중 오류가 발생했습니다")
+
+@app.get("/admin/analytics", response_class=HTMLResponse)
+async def admin_analytics_page(
+    current_user: Annotated[UserResponse, Depends(require_admin)]
+):
+    """사용 분석 대시보드"""
+    try:
+        logger.info("분석 페이지 로딩 시작", user_id=current_user.id)
+        
+        # Breadcrumb
+        breadcrumb = AdminBreadcrumb([
+            {"label": "관리자", "url": "/admin"},
+            {"label": "사용 분석"}
+        ])
+        
+        # 메트릭 데이터 조회 (현재는 Mock 데이터, 향후 실제 MetricsMiddleware 연동)
+        metrics_data = await get_analytics_data()
+        
+        # Chart.js 데이터 생성
+        chart_data = generate_chart_data(metrics_data)
+        
+        # 통계 카드들
+        stats_cards = Div(
+            StatsCard(
+                title="총 요청 수",
+                value=metrics_data["total_requests"],
+                color="blue",
+                icon="📊",
+                trend={"value": "+12%", "positive": True}
+            ),
+            StatsCard(
+                title="성공률",
+                value=f"{metrics_data['success_rate']:.1f}%",
+                color="green",
+                icon="✅",
+                trend={"value": "+2.3%", "positive": True}
+            ),
+            StatsCard(
+                title="평균 응답시간",
+                value=f"{metrics_data['avg_response_time']:.0f}ms",
+                color="yellow",
+                icon="⚡",
+                trend={"value": "-15ms", "positive": True}
+            ),
+            StatsCard(
+                title="활성 사용자",
+                value=metrics_data["active_users"],
+                color="purple",
+                icon="👥",
+                trend={"value": "+5", "positive": True}
+            ),
+            cls="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8"
+        )
+        
+        # 차트 섹션
+        charts_section = Div(
+            # 도구 사용량 바차트와 시간별 활동 라인차트
+            Div(
+                AnalyticsChart(
+                    chart_type="bar",
+                    data=chart_data["tool_usage"],
+                    canvas_id="tool-usage-chart",
+                    title="도구별 사용량"
+                ),
+                AnalyticsChart(
+                    chart_type="line",
+                    data=chart_data["activity_timeline"],
+                    canvas_id="activity-timeline-chart",
+                    title="시간별 활동"
+                ),
+                cls="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6"
+            ),
+            
+            # 응답시간 히스토그램과 사용자별 활동 도넛차트
+            Div(
+                AnalyticsChart(
+                    chart_type="bar",
+                    data=chart_data["response_time_histogram"],
+                    canvas_id="response-time-chart",
+                    title="응답시간 분포"
+                ),
+                AnalyticsChart(
+                    chart_type="doughnut",
+                    data=chart_data["user_activity"],
+                    canvas_id="user-activity-chart",
+                    title="사용자별 활동"
+                ),
+                cls="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8"
+            ),
+            
+            # 차트 자동 업데이트를 위한 JavaScript
+            Script("""
+                // 차트 업데이트 함수
+                async function updateCharts() {
+                    try {
+                        const response = await fetch('/admin/analytics/charts-data');
+                        const chartData = await response.json();
+                        
+                        // 전역 chartInstances에서 차트 인스턴스 확인
+                        if (typeof window.chartInstances !== 'undefined') {
+                            // 각 차트 업데이트
+                            Object.keys(chartData).forEach(chartKey => {
+                                const canvasId = chartKey.replace(/[_]/g, '-') + '-chart';
+                                const chart = window.chartInstances[canvasId];
+                                if (chart) {
+                                    chart.data = chartData[chartKey];
+                                    chart.update('none'); // 애니메이션 없이 업데이트
+                                }
+                            });
+                        }
+                    } catch (error) {
+                        console.error('차트 업데이트 실패:', error);
+                    }
+                }
+                
+                // 페이지 로드 후 차트 업데이트 함수 등록
+                document.addEventListener('DOMContentLoaded', function() {
+                    // 30초마다 차트 업데이트
+                    setInterval(updateCharts, 30000);
+                });
+            """),
+            cls="charts-container"
+        )
+        
+        # 도구별 사용 통계 테이블
+        tool_headers = ["도구명", "사용 횟수", "평균 응답시간", "성공률", "마지막 사용"]
+        tool_rows = []
+        for tool_name, stats in metrics_data["tool_stats"].items():
+            tool_rows.append([
+                tool_name,
+                str(stats["count"]),
+                f"{stats['avg_duration']:.0f}ms",
+                f"{stats['success_rate']:.1f}%",
+                stats["last_used"]
+            ])
+        
+        tool_usage_table = AdminTable(
+            headers=tool_headers,
+            rows=tool_rows,
+            table_id="tool-usage-table",
+            empty_message="도구 사용 데이터가 없습니다."
+        )
+        
+        # 필터 옵션
+        filter_options = [
+            {"name": "period", "label": "기간", "options": [
+                {"value": "1h", "label": "최근 1시간"},
+                {"value": "24h", "label": "최근 24시간"},
+                {"value": "7d", "label": "최근 7일"},
+                {"value": "30d", "label": "최근 30일"}
+            ]},
+            {"name": "tool", "label": "도구", "options": [
+                {"value": "search_web", "label": "웹 검색"},
+                {"value": "search_vectors", "label": "벡터 검색"},
+                {"value": "search_database", "label": "데이터베이스 검색"},
+                {"value": "health_check", "label": "헬스 체크"}
+            ]}
+        ]
+        
+        filter_bar = FilterBar(
+            filters=filter_options,
+            search_placeholder="사용자 검색...",
+            htmx_target="#analytics-content",
+            htmx_endpoint="/admin/analytics/data",
+            container_id="analytics-filter"
+        )
+        
+        # 메인 콘텐츠
+        content = Div(
+            breadcrumb,
+            H1("사용 분석", cls="text-3xl font-bold text-gray-900 mb-8"),
+            
+            # 통계 카드
+            stats_cards,
+            
+            # 차트 섹션
+            charts_section,
+            
+            # 필터 및 도구 통계
+            AdminCard(
+                title="도구 사용 통계",
+                content=Div(
+                    filter_bar,
+                    Div(
+                        tool_usage_table,
+                        id="analytics-content",
+                        **{
+                            "hx-get": "/admin/analytics/data",
+                            "hx-trigger": "every 30s",
+                            "hx-include": "#analytics-filter"
+                        }
+                    )
+                ),
+                color="white"
+            ),
+            
+            # 시스템 정보
+            AdminCard(
+                title="시스템 정보",
+                content=Div(
+                    P(f"마지막 업데이트: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", cls="text-sm text-gray-600"),
+                    P("데이터 소스: MCP Server 메트릭 (향후 실시간 연동 예정)", cls="text-xs text-gray-500"),
+                    cls="space-y-2"
+                ),
+                color="gray"
+            ),
+            
+            cls="space-y-8"
+        )
+        
+        logger.info("분석 페이지 로딩 완료", user_id=current_user.id)
+        
+        page = create_layout("사용 분석", content, current_user)
+        html_content = to_xml(page)
+        return HTMLResponse(content=html_content)
+        
+    except Exception as e:
+        logger.error("분석 페이지 로딩 실패", error=str(e))
+        error_content = Div(
+            H1("오류", cls="text-3xl font-bold text-red-600 mb-4"),
+            P(f"분석 페이지를 로드하는 중 오류가 발생했습니다: {str(e)}", cls="text-gray-700"),
+        )
+        page = create_layout("오류", error_content, current_user)
+        html_content = to_xml(page)
+        return HTMLResponse(content=html_content, status_code=500)
+
+@app.get("/admin/analytics/data", response_class=HTMLResponse)
+async def admin_analytics_data(
+    current_user: Annotated[UserResponse, Depends(require_admin)],
+    period: Optional[str] = None,
+    tool: Optional[str] = None,
+    search: Optional[str] = None
+):
+    """분석 데이터 (HTMX 자동 새로고침용)"""
+    try:
+        logger.debug("분석 데이터 업데이트", user_id=current_user.id, period=period, tool=tool)
+        
+        # 필터링된 메트릭 데이터 조회
+        metrics_data = await get_analytics_data(period=period, tool_filter=tool, search=search)
+        
+        # 도구별 사용 통계 테이블 재생성
+        tool_headers = ["도구명", "사용 횟수", "평균 응답시간", "성공률", "마지막 사용"]
+        tool_rows = []
+        for tool_name, stats in metrics_data["tool_stats"].items():
+            tool_rows.append([
+                tool_name,
+                str(stats["count"]),
+                f"{stats['avg_duration']:.0f}ms",
+                f"{stats['success_rate']:.1f}%",
+                stats["last_used"]
+            ])
+        
+        table = AdminTable(
+            headers=tool_headers,
+            rows=tool_rows,
+            table_id="tool-usage-table",
+            empty_message="필터 조건에 맞는 데이터가 없습니다."
+        )
+        
+        return HTMLResponse(content=to_xml(table))
+        
+    except Exception as e:
+        logger.error("분석 데이터 업데이트 실패", error=str(e))
+        return HTMLResponse(
+            content='<div class="text-red-600 p-3 bg-red-50 rounded">데이터 업데이트 중 오류가 발생했습니다.</div>'
+        )
+
+@app.get("/admin/analytics/charts-data")
+async def admin_analytics_charts_data(
+    current_user: Annotated[UserResponse, Depends(require_admin)],
+    period: Optional[str] = None,
+    tool: Optional[str] = None
+):
+    """차트 데이터 JSON 제공 (HTMX + JavaScript 차트 업데이트용)"""
+    try:
+        logger.debug("차트 데이터 업데이트", user_id=current_user.id, period=period, tool=tool)
+        
+        # 필터링된 메트릭 데이터 조회
+        metrics_data = await get_analytics_data(period=period, tool_filter=tool)
+        
+        # Chart.js 데이터 생성
+        chart_data = generate_chart_data(metrics_data)
+        
+        return JSONResponse(content=chart_data)
+        
+    except Exception as e:
+        logger.error("차트 데이터 업데이트 실패", error=str(e))
+        return JSONResponse(
+            content={"error": "차트 데이터 업데이트 중 오류가 발생했습니다."},
+            status_code=500
+        )
+
+async def get_analytics_data(
+    period: Optional[str] = None,
+    tool_filter: Optional[str] = None,
+    search: Optional[str] = None
+) -> Dict[str, Any]:
+    """분석 데이터 조회 (현재는 Mock 데이터, 향후 실제 메트릭 연동)"""
+    
+    # TODO: 실제 MetricsMiddleware 데이터 연동
+    # 현재는 Mock 데이터로 기본 구조 구현
+    
+    base_data = {
+        "total_requests": 1247,
+        "success_rate": 97.8,
+        "avg_response_time": 156.3,
+        "active_users": 12,
+        "tool_stats": {
+            "search_web": {
+                "count": 456,
+                "avg_duration": 234.5,
+                "success_rate": 98.2,
+                "last_used": "2분 전"
+            },
+            "search_vectors": {
+                "count": 234,
+                "avg_duration": 189.3,
+                "success_rate": 96.5,
+                "last_used": "5분 전"
+            },
+            "search_database": {
+                "count": 345,
+                "avg_duration": 78.9,
+                "success_rate": 99.1,
+                "last_used": "1분 전"
+            },
+            "health_check": {
+                "count": 212,
+                "avg_duration": 12.1,
+                "success_rate": 100.0,
+                "last_used": "30초 전"
+            }
+        }
+    }
+    
+    # 필터 적용 시뮬레이션
+    if tool_filter:
+        filtered_stats = {k: v for k, v in base_data["tool_stats"].items() if k == tool_filter}
+        base_data["tool_stats"] = filtered_stats
+    
+    if search:
+        # 사용자 검색 시뮬레이션 (실제로는 사용자별 메트릭 필터링)
+        pass
+    
+    return base_data
+
+def generate_chart_data(metrics_data: Dict[str, Any]) -> Dict[str, Any]:
+    """메트릭 데이터를 Chart.js 형식으로 변환"""
+    
+    # 도구별 사용량 바차트 데이터
+    tool_names = list(metrics_data["tool_stats"].keys())
+    tool_counts = [stats["count"] for stats in metrics_data["tool_stats"].values()]
+    
+    tool_usage_data = {
+        "labels": [name.replace("search_", "").replace("_", " ").title() for name in tool_names],
+        "datasets": [{
+            "label": "사용 횟수",
+            "data": tool_counts,
+            "backgroundColor": [
+                "rgba(59, 130, 246, 0.8)",    # Blue
+                "rgba(16, 185, 129, 0.8)",    # Green  
+                "rgba(245, 158, 11, 0.8)",    # Yellow
+                "rgba(139, 92, 246, 0.8)"     # Purple
+            ],
+            "borderColor": [
+                "rgb(59, 130, 246)",
+                "rgb(16, 185, 129)",
+                "rgb(245, 158, 11)",
+                "rgb(139, 92, 246)"
+            ],
+            "borderWidth": 1
+        }]
+    }
+    
+    # 시간별 활동 라인차트 데이터 (Mock 시간 데이터)
+    activity_timeline_data = {
+        "labels": ["06:00", "09:00", "12:00", "15:00", "18:00", "21:00"],
+        "datasets": [{
+            "label": "요청 수",
+            "data": [45, 120, 89, 156, 203, 78],
+            "borderColor": "rgb(59, 130, 246)",
+            "backgroundColor": "rgba(59, 130, 246, 0.1)",
+            "tension": 0.4,
+            "fill": True
+        }]
+    }
+    
+    # 응답시간 히스토그램 데이터
+    response_time_data = {
+        "labels": ["0-50ms", "50-100ms", "100-200ms", "200-500ms", "500ms+"],
+        "datasets": [{
+            "label": "요청 수",
+            "data": [234, 456, 189, 67, 12],
+            "backgroundColor": "rgba(16, 185, 129, 0.8)",
+            "borderColor": "rgb(16, 185, 129)",
+            "borderWidth": 1
+        }]
+    }
+    
+    # 사용자별 활동 도넛차트 데이터
+    user_activity_data = {
+        "labels": ["Admin", "일반 사용자", "분석가", "게스트"],
+        "datasets": [{
+            "label": "활동량",
+            "data": [35, 45, 15, 5],
+            "backgroundColor": [
+                "rgba(239, 68, 68, 0.8)",     # Red
+                "rgba(59, 130, 246, 0.8)",    # Blue
+                "rgba(245, 158, 11, 0.8)",    # Yellow
+                "rgba(107, 114, 128, 0.8)"    # Gray
+            ],
+            "borderColor": [
+                "rgb(239, 68, 68)",
+                "rgb(59, 130, 246)",
+                "rgb(245, 158, 11)", 
+                "rgb(107, 114, 128)"
+            ],
+            "borderWidth": 2
+        }]
+    }
+    
+    return {
+        "tool_usage": tool_usage_data,
+        "activity_timeline": activity_timeline_data,
+        "response_time_histogram": response_time_data,
+        "user_activity": user_activity_data
+    }
+
+@app.get("/admin/empty", response_class=HTMLResponse)
+async def empty_response():
+    """빈 응답을 반환하는 엔드포인트 (모달 닫기 등에 사용)"""
+    return HTMLResponse(content="")
+
+# === 로그인 페이지 테스트 엔드포인트 ===
+
+@app.get("/auth/test-me", response_class=HTMLResponse)
+async def test_auth_me_htmx(request: Request):
+    """HTMX: 현재 사용자 정보 조회 테스트"""
+    try:
+        # Authorization 헤더에서 토큰 추출
+        auth_header = request.headers.get("Authorization")
+        if not auth_header or not auth_header.startswith("Bearer "):
+            return HTMLResponse(
+                content='<p class="error">먼저 로그인하세요.</p>'
+            )
+        
+        token = auth_header[7:]  # "Bearer " 제거
+        
+        # /auth/me API 호출
+        import httpx
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{request.base_url}auth/me",
+                headers={"Authorization": f"Bearer {token}"}
+            )
+            
+            if response.status_code == 200:
+                user_data = response.json()
+                formatted_data = f"<pre>{user_data}</pre>".replace('"', '&quot;')
+                return HTMLResponse(
+                    content=f'<p class="success">사용자 정보: {formatted_data}</p>'
+                )
+            else:
+                return HTMLResponse(
+                    content='<p class="error">인증 실패: 토큰이 유효하지 않습니다.</p>'
+                )
+                
+    except Exception as e:
+        return HTMLResponse(
+            content=f'<p class="error">네트워크 오류가 발생했습니다: {str(e)}</p>'
+        )
+
+# === 권한 삭제 HTMX 엔드포인트 ===
+
+@app.delete("/admin/permissions/delete/{permission_id}", response_class=HTMLResponse)
+async def delete_permission_htmx(
+    permission_id: str,
+    request: Request,
+    current_user: Annotated[UserResponse, Depends(require_admin)],
+):
+    """HTMX: 권한 삭제"""
+    try:
+        # Authorization 헤더에서 토큰 추출
+        auth_header = request.headers.get("Authorization")
+        if not auth_header or not auth_header.startswith("Bearer "):
+            return HTMLResponse(
+                content='<div class="text-red-600 p-3 bg-red-50 rounded">인증이 필요합니다.</div>'
+            )
+        
+        token = auth_header[7:]  # "Bearer " 제거
+        
+        # API 호출을 통한 권한 삭제
+        import httpx
+        async with httpx.AsyncClient() as client:
+            response = await client.delete(
+                f"{request.base_url}api/v1/permissions/resources/{permission_id}",
+                headers={"Authorization": f"Bearer {token}"}
+            )
+            
+            if response.status_code == 200:
+                return HTMLResponse(
+                    content='<div class="text-green-600 p-3 bg-green-50 rounded">권한이 삭제되었습니다.</div>',
+                    headers={"HX-Refresh": "true"}  # 페이지 새로고침
+                )
+            else:
+                return HTMLResponse(
+                    content='<div class="text-red-600 p-3 bg-red-50 rounded">권한 삭제 중 오류가 발생했습니다.</div>'
+                )
+                
+    except Exception as e:
+        logger.error("권한 삭제 오류", error=str(e), permission_id=permission_id)
+        return HTMLResponse(
+            content=f'<div class="text-red-600 p-3 bg-red-50 rounded">오류가 발생했습니다: {str(e)}</div>'
+        )
+
+def create_layout(title: str, content, current_user=None, request: Optional[Request] = None):
+    """공통 레이아웃 템플릿 (다국어 지원)"""
+    # 현재 언어 설정 가져오기
+    current_lang = get_user_language(request) if request else 'ko'
+    
     # FastHTML에서는 to_xml()을 직접 호출하지 않고 객체를 반환
     # FastAPI HTMLResponse와 함께 사용시 자동으로 변환됨
     return Html(
@@ -2070,15 +2831,136 @@ def create_layout(title: str, content, current_user=None):
                 rel="stylesheet",
                 href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css",
             ),
-            # Alpine.js for interactivity
-            Script(src="https://unpkg.com/alpinejs@3.x.x/dist/cdn.min.js", defer=True),
+            # HTMX for interactivity (Alpine.js removed - using HTMX for all interactions)
+            Script(src="https://unpkg.com/htmx.org@1.9.12"),
+            # Chart.js for analytics charts
+            Script(src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.min.js"),
+            # HTMX SSE 확장
+            Script(src="https://unpkg.com/htmx.org@1.9.12/dist/ext/sse.js"),
+            
+            # SSE 이벤트 처리 스크립트
+            Script("""
+                document.addEventListener('DOMContentLoaded', function() {
+                    const sseConnection = document.getElementById('sse-connection');
+                    const notificationArea = document.getElementById('notification-area');
+                    
+                    if (sseConnection) {
+                        // SSE 메시지 수신 이벤트
+                        document.body.addEventListener('htmx:sseMessage', function(event) {
+                            try {
+                                const data = JSON.parse(event.detail.data);
+                                
+                                // heartbeat 이벤트는 무시
+                                if (data.type === 'heartbeat') {
+                                    return;
+                                }
+                                
+                                // 알림 생성
+                                const notification = createNotification(data);
+                                notificationArea.appendChild(notification);
+                                
+                                // 5초 후 자동 제거
+                                setTimeout(() => {
+                                    if (notification && notification.parentNode) {
+                                        notification.style.opacity = '0';
+                                        setTimeout(() => {
+                                            notification.remove();
+                                        }, 300);
+                                    }
+                                }, 5000);
+                                
+                            } catch (e) {
+                                console.error('SSE 메시지 파싱 오류:', e);
+                            }
+                        });
+                        
+                        // SSE 연결 오류 처리
+                        document.body.addEventListener('htmx:sseError', function(event) {
+                            console.error('SSE 연결 오류:', event.detail);
+                        });
+                    }
+                    
+                    function createNotification(data) {
+                        const notification = document.createElement('div');
+                        const typeConfig = {
+                            'success': {
+                                bg: 'bg-green-50',
+                                border: 'border-green-200',
+                                text: 'text-green-800',
+                                icon: '✅'
+                            },
+                            'warning': {
+                                bg: 'bg-yellow-50',
+                                border: 'border-yellow-200',
+                                text: 'text-yellow-800',
+                                icon: '⚠️'
+                            },
+                            'error': {
+                                bg: 'bg-red-50',
+                                border: 'border-red-200',
+                                text: 'text-red-800',
+                                icon: '❌'
+                            },
+                            'info': {
+                                bg: 'bg-blue-50',
+                                border: 'border-blue-200',
+                                text: 'text-blue-800',
+                                icon: 'ℹ️'
+                            }
+                        };
+                        
+                        const config = typeConfig[data.type] || typeConfig['info'];
+                        
+                        notification.className = `p-4 mb-2 ${config.bg} ${config.border} border rounded-lg shadow-lg transition-opacity duration-300`;
+                        notification.innerHTML = `
+                            <div class="flex items-start justify-between">
+                                <div class="flex items-start">
+                                    <span class="text-lg mr-2">${config.icon}</span>
+                                    <div>
+                                        ${data.title ? `<div class="font-semibold ${config.text} mb-1">${data.title}</div>` : ''}
+                                        <div class="${config.text}">${data.message}</div>
+                                        <div class="text-xs text-gray-500 mt-1">${new Date(data.timestamp).toLocaleTimeString()}</div>
+                                    </div>
+                                </div>
+                                <button onclick="this.parentElement.parentElement.remove()" class="ml-2 ${config.text} hover:opacity-70">
+                                    ×
+                                </button>
+                            </div>
+                        `;
+                        
+                        return notification;
+                    }
+                });
+            """)
         ),
         Body(
+            # SSE 연결 설정 (관리자인 경우에만)
+            Div(
+                id="sse-connection",
+                **{
+                    "hx-ext": "sse",
+                    "sse-connect": "/admin/events",
+                    "sse-swap": "message",
+                    "hx-target": "#notification-area",
+                    "style": "display: none;"
+                } if request and current_user else {}
+            ),
+            
+            # 실시간 알림 표시 영역
+            Div(id="notification-area", cls="fixed top-20 right-4 z-50 space-y-2 max-w-md"),
+            
             # Navigation
             Nav(
                 Div(
                     Div(
                         H1("MCP Auth Gateway", cls="text-xl font-bold text-white"),
+                        # 언어 선택기 추가
+                        LanguageSelector(
+                            current_language=current_lang,
+                            endpoint="/admin/change-language",
+                            target="body",
+                            size="sm"
+                        ) if request else "",
                         cls="container mx-auto px-4 py-3 flex justify-between items-center",
                     ),
                     cls="bg-blue-600",
@@ -2086,27 +2968,32 @@ def create_layout(title: str, content, current_user=None):
                 Div(
                     Div(
                         A(
-                            "대시보드",
+                            T("nav_dashboard", request),
                             href="/admin",
                             cls="px-3 py-2 text-sm font-medium text-gray-700 hover:text-blue-600",
                         ),
                         A(
-                            "사용자 관리",
+                            T("nav_users", request),
                             href="/admin/users",
                             cls="px-3 py-2 text-sm font-medium text-gray-700 hover:text-blue-600",
                         ),
                         A(
-                            "세션 관리",
+                            T("nav_sessions", request),
                             href="/admin/sessions",
                             cls="px-3 py-2 text-sm font-medium text-gray-700 hover:text-blue-600",
                         ),
                         A(
-                            "권한 관리",
+                            T("nav_analytics", request),
+                            href="/admin/analytics",
+                            cls="px-3 py-2 text-sm font-medium text-gray-700 hover:text-blue-600",
+                        ),
+                        A(
+                            T("nav_permissions", request),
                             href="/admin/permissions",
                             cls="px-3 py-2 text-sm font-medium text-gray-700 hover:text-blue-600",
                         ),
                         A(
-                            "역할 관리",
+                            T("nav_roles", request),
                             href="/admin/roles",
                             cls="px-3 py-2 text-sm font-medium text-gray-700 hover:text-blue-600",
                         ),
@@ -2122,8 +3009,112 @@ def create_layout(title: str, content, current_user=None):
     )
 
 
+@app.post("/admin/change-language", response_class=HTMLResponse)
+async def change_language(
+    request: Request,
+    language: str = Form(),
+    current_user: Annotated[UserResponse, Depends(require_admin)] = None
+):
+    """언어 설정 변경"""
+    try:
+        # 지원되는 언어인지 확인
+        if language not in SUPPORTED_LANGUAGES:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"지원되지 않는 언어입니다: {language}"
+            )
+        
+        # 세션에 언어 설정 저장
+        if hasattr(request, 'session'):
+            request.session['language'] = language
+        
+        # 현재 페이지로 리다이렉트 (Referer 헤더 사용)
+        referer = request.headers.get('referer', '/admin')
+        
+        # 성공 메시지와 함께 현재 페이지 새로고침
+        return Response(
+            content="",
+            status_code=200,
+            headers={
+                "HX-Redirect": referer,
+                "HX-Trigger": f"languageChanged:{language}"
+            }
+        )
+        
+    except Exception as e:
+        logger.error(f"언어 변경 실패: {str(e)}")
+        return HTMLResponse(
+            content=f'<div class="text-red-600 p-3 bg-red-50 rounded mb-4">'
+                   f'{T("operation_failed", request)}: {str(e)}</div>',
+            status_code=500
+        )
+
+
+@app.get("/admin/events")
+async def stream_admin_events(
+    request: Request,
+    current_user: Annotated[UserResponse, Depends(require_admin)]
+):
+    """관리자용 SSE 이벤트 스트림"""
+    
+    async def event_generator() -> AsyncGenerator[str, None]:
+        connection_id = id(request)
+        active_connections.add(connection_id)
+        
+        try:
+            logger.info(f"SSE 연결 시작: {current_user.email} (연결 ID: {connection_id})")
+            
+            # 연결 확인 메시지
+            initial_event = {
+                "type": "success",
+                "message": "실시간 알림이 활성화되었습니다.",
+                "title": "연결 성공",
+                "timestamp": datetime.utcnow().isoformat()
+            }
+            yield f"data: {json.dumps(initial_event)}\n\n"
+            
+            # 기존 이벤트 전송 (최근 5개)
+            recent_events = list(event_queue)[-5:] if event_queue else []
+            for event in recent_events:
+                yield f"data: {json.dumps(event)}\n\n"
+            
+            last_event_count = len(event_queue)
+            
+            # 실시간 이벤트 스트림
+            while True:
+                # 새 이벤트 확인
+                current_event_count = len(event_queue)
+                if current_event_count > last_event_count:
+                    # 새 이벤트들 전송
+                    new_events = list(event_queue)[last_event_count:]
+                    for event in new_events:
+                        yield f"data: {json.dumps(event)}\n\n"
+                    last_event_count = current_event_count
+                
+                # 연결 유지를 위한 heartbeat (30초마다)
+                heartbeat = {
+                    "type": "heartbeat",
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "active_connections": len(active_connections)
+                }
+                yield f"data: {json.dumps(heartbeat)}\n\n"
+                
+                # 5초 대기
+                await asyncio.sleep(5)
+                
+        except asyncio.CancelledError:
+            logger.info(f"SSE 연결 종료: {current_user.email}")
+        except Exception as e:
+            logger.error(f"SSE 연결 오류: {str(e)}")
+        finally:
+            active_connections.discard(connection_id)
+    
+    return EventSourceResponse(event_generator())
+
+
 @app.get("/admin", response_class=HTMLResponse)
 async def admin_dashboard(
+    request: Request,
     current_user: Annotated[UserResponse, Depends(require_admin)],
     auth_service: Annotated[SQLiteAuthService, Depends(get_sqlite_auth_service)],
     db: Annotated[AsyncSession, Depends(get_db)],
@@ -2136,96 +3127,149 @@ async def admin_dashboard(
         repository = SQLiteUserRepository(db)
         stats = await repository.get_user_stats()
 
-        content = Div(
-            H1("관리자 대시보드", cls="text-3xl font-bold text-gray-900 mb-8"),
-            # 통계 카드들
-            Div(
-                # 총 사용자 수
-                Div(
-                    Div(
-                        H3("총 사용자", cls="text-lg font-semibold text-gray-700"),
-                        P(
-                            str(stats.get("total_users", 0)),
-                            cls="text-3xl font-bold text-blue-600",
-                        ),
-                        cls="p-6",
-                    ),
-                    cls="bg-white rounded-lg shadow-md",
-                ),
-                # 활성 사용자 수
-                Div(
-                    Div(
-                        H3("활성 사용자", cls="text-lg font-semibold text-gray-700"),
-                        P(
-                            str(stats.get("active_users", 0)),
-                            cls="text-3xl font-bold text-green-600",
-                        ),
-                        cls="p-6",
-                    ),
-                    cls="bg-white rounded-lg shadow-md",
-                ),
-                # 관리자 수
-                Div(
-                    Div(
-                        H3("관리자", cls="text-lg font-semibold text-gray-700"),
-                        P(
-                            str(stats.get("admin_users", 0)),
-                            cls="text-3xl font-bold text-purple-600",
-                        ),
-                        cls="p-6",
-                    ),
-                    cls="bg-white rounded-lg shadow-md",
-                ),
-                # 오늘 가입
-                Div(
-                    Div(
-                        H3("오늘 가입", cls="text-lg font-semibold text-gray-700"),
-                        P(
-                            str(stats.get("today_registrations", 0)),
-                            cls="text-3xl font-bold text-orange-600",
-                        ),
-                        cls="p-6",
-                    ),
-                    cls="bg-white rounded-lg shadow-md",
-                ),
-                cls="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8",
+        # AdminBreadcrumb 사용 (번역 적용)
+        breadcrumb = AdminBreadcrumb([
+            {"label": T("admin", request), "url": "/admin"},
+            {"label": T("dashboard", request)}
+        ])
+
+        # StatsCard들 생성 (번역 적용)
+        stats_cards = Div(
+            StatsCard(
+                title=T("total_users", request),
+                value=stats.get("total_users", 0),
+                color="blue",
+                icon="👥",
+                subtitle=T("total_users", request)
             ),
-            # 빠른 액션
-            Div(
-                H2("빠른 액션", cls="text-2xl font-bold text-gray-900 mb-4"),
-                Div(
-                    A(
-                        "사용자 관리",
-                        href="/admin/users",
-                        cls="inline-block bg-blue-500 hover:bg-blue-600 text-white font-medium py-2 px-4 rounded-lg mr-4 mb-2",
-                    ),
-                    A(
-                        "권한 설정",
-                        href="/admin/permissions",
-                        cls="inline-block bg-green-500 hover:bg-green-600 text-white font-medium py-2 px-4 rounded-lg mr-4 mb-2",
-                    ),
-                    A(
-                        "역할 관리",
-                        href="/admin/roles",
-                        cls="inline-block bg-purple-500 hover:bg-purple-600 text-white font-medium py-2 px-4 rounded-lg mr-4 mb-2",
-                    ),
-                    A(
-                        "세션 관리",
-                        href="/admin/sessions",
-                        cls="inline-block bg-orange-500 hover:bg-orange-600 text-white font-medium py-2 px-4 rounded-lg mr-4 mb-2",
-                    ),
-                    A(
-                        "API 문서",
-                        href="/docs",
-                        cls="inline-block bg-gray-500 hover:bg-gray-600 text-white font-medium py-2 px-4 rounded-lg mr-4 mb-2",
-                    ),
-                ),
-                cls="bg-white rounded-lg shadow-md p-6",
+            StatsCard(
+                title=T("active_users", request), 
+                value=stats.get("active_users", 0),
+                color="green",
+                icon="✅",
+                subtitle=T("active_users", request),
+                trend={"value": "+12%", "positive": True} if stats.get("active_users", 0) > 0 else None
             ),
+            StatsCard(
+                title=T("admin_users", request),
+                value=stats.get("admin_users", 0),
+                color="purple", 
+                icon="👑",
+                subtitle=T("admin_users", request)
+            ),
+            StatsCard(
+                title=T("new_users_today", request),
+                value=stats.get("today_registrations", 0),
+                color="yellow",
+                icon="📈",
+                subtitle=T("new_users_today", request),
+                trend={"value": "+3", "positive": True} if stats.get("today_registrations", 0) > 0 else None
+            ),
+            cls="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8"
         )
 
-        page = create_layout("대시보드", content, current_user)
-        # FastHTML 객체를 HTML 문자열로 변환
+        # 빠른 액션 버튼들 (번역 적용)
+        quick_actions = [
+            A(
+                f"👥 {T('nav_users', request)}",
+                href="/admin/users",
+                cls="inline-block bg-blue-500 hover:bg-blue-600 text-white font-medium py-3 px-6 rounded-lg mr-4 mb-2 transition-colors"
+            ),
+            A(
+                f"🔒 {T('nav_permissions', request)}", 
+                href="/admin/permissions",
+                cls="inline-block bg-green-500 hover:bg-green-600 text-white font-medium py-3 px-6 rounded-lg mr-4 mb-2 transition-colors"
+            ),
+            A(
+                f"⚡ {T('nav_roles', request)}",
+                href="/admin/roles", 
+                cls="inline-block bg-purple-500 hover:bg-purple-600 text-white font-medium py-3 px-6 rounded-lg mr-4 mb-2 transition-colors"
+            ),
+            A(
+                f"🔐 {T('nav_sessions', request)}",
+                href="/admin/sessions",
+                cls="inline-block bg-orange-500 hover:bg-orange-600 text-white font-medium py-3 px-6 rounded-lg mr-4 mb-2 transition-colors"
+            ),
+            A(
+                "📚 API 문서",
+                href="/docs",
+                cls="inline-block bg-gray-500 hover:bg-gray-600 text-white font-medium py-3 px-6 rounded-lg mr-4 mb-2 transition-colors"
+            ),
+            A(
+                "📊 메트릭 내보내기",
+                href="/admin/export/metrics.json",
+                cls="inline-block bg-indigo-500 hover:bg-indigo-600 text-white font-medium py-3 px-6 rounded-lg mr-4 mb-2 transition-colors",
+                download="metrics.json"
+            ),
+            A(
+                "📈 사용 분석",
+                href="/admin/analytics",
+                cls="inline-block bg-cyan-500 hover:bg-cyan-600 text-white font-medium py-3 px-6 rounded-lg mr-4 mb-2 transition-colors"
+            )
+        ]
+
+        # AdminCard로 빠른 액션 섹션 생성
+        quick_actions_card = AdminCard(
+            title="빠른 액션",
+            content=Div(*quick_actions, cls="flex flex-wrap"),
+            color="white"
+        )
+
+        # 최근 활동 카드 (추가)
+        recent_activity_card = AdminCard(
+            title="최근 활동",
+            content=Div(
+                P("• 새로운 사용자 3명이 가입했습니다", cls="text-sm text-gray-600 mb-2"),
+                P("• 권한 설정이 2건 변경되었습니다", cls="text-sm text-gray-600 mb-2"),
+                P("• 시스템 상태: 정상", cls="text-sm text-green-600 font-medium")
+            ),
+            color="gray"
+        )
+
+        content = Div(
+            breadcrumb,
+            H1("관리자 대시보드", cls="text-3xl font-bold text-gray-900 mb-8"),
+            
+            # 통계 카드들
+            stats_cards,
+            
+            # 카드 섹션들
+            Div(
+                quick_actions_card,
+                recent_activity_card,
+                cls="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-8"
+            ),
+            
+            # 시스템 정보 카드
+            AdminCard(
+                title="시스템 정보",
+                content=Div(
+                    Div(
+                        Strong("서버 상태: "), 
+                        Span("🟢 정상", cls="text-green-600 font-medium"),
+                        cls="mb-2"
+                    ),
+                    Div(
+                        Strong("데이터베이스: "),
+                        Span("🟢 연결됨", cls="text-green-600 font-medium"), 
+                        cls="mb-2"
+                    ),
+                    Div(
+                        Strong("캐시: "),
+                        Span("🟢 작동 중", cls="text-green-600 font-medium"),
+                        cls="mb-2"
+                    ),
+                    Div(
+                        Strong("마지막 백업: "),
+                        Span("2시간 전", cls="text-gray-600"),
+                        cls="mb-2"
+                    )
+                ),
+                color="blue"
+            )
+        )
+
+        page = create_layout(T("dashboard", request), content, current_user, request)
         html_content = to_xml(page)
         return HTMLResponse(content=html_content)
 
@@ -2257,101 +3301,174 @@ async def admin_users_page(
         repository = SQLiteUserRepository(db)
         users = await repository.list_all(skip=0, limit=50)
 
-        content = Div(
-            H1("사용자 관리", cls="text-3xl font-bold text-gray-900 mb-8"),
-            # 사용자 목록 테이블
-            Div(
-                Table(
-                    Thead(
-                        Tr(
-                            Th(
-                                "ID",
-                                cls="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider",
-                            ),
-                            Th(
-                                "이메일",
-                                cls="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider",
-                            ),
-                            Th(
-                                "사용자명",
-                                cls="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider",
-                            ),
-                            Th(
-                                "역할",
-                                cls="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider",
-                            ),
-                            Th(
-                                "상태",
-                                cls="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider",
-                            ),
-                            Th(
-                                "가입일",
-                                cls="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider",
-                            ),
-                            Th(
-                                "액션",
-                                cls="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider",
-                            ),
-                        )
-                    ),
-                    Tbody(
-                        *[
-                            Tr(
-                                Td(
-                                    str(user.id),
-                                    cls="px-6 py-4 whitespace-nowrap text-sm text-gray-900",
-                                ),
-                                Td(
-                                    user.email,
-                                    cls="px-6 py-4 whitespace-nowrap text-sm text-gray-900",
-                                ),
-                                Td(
-                                    user.username or "-",
-                                    cls="px-6 py-4 whitespace-nowrap text-sm text-gray-900",
-                                ),
-                                Td(
-                                    ", ".join(user.roles),
-                                    cls="px-6 py-4 whitespace-nowrap text-sm text-gray-900",
-                                ),
-                                Td(
-                                    Span(
-                                        "활성" if user.is_active else "비활성",
-                                        cls=f"px-2 inline-flex text-xs leading-5 font-semibold rounded-full {'bg-green-100 text-green-800' if user.is_active else 'bg-red-100 text-red-800'}",
-                                    ),
-                                    cls="px-6 py-4 whitespace-nowrap",
-                                ),
-                                Td(
-                                    user.created_at.strftime("%Y-%m-%d"),
-                                    cls="px-6 py-4 whitespace-nowrap text-sm text-gray-900",
-                                ),
-                                Td(
-                                    Button(
-                                        "권한 보기",
-                                        onclick=f"window.location.href='/admin/users/{user.id}/permissions'",
-                                        cls="text-blue-600 hover:text-blue-900 text-sm font-medium mr-2",
-                                    ),
-                                    Button(
-                                        "역할 변경",
-                                        onclick=f"openRoleModal({user.id}, '{user.email}', {user.roles})",
-                                        cls="text-green-600 hover:text-green-900 text-sm font-medium",
-                                    ),
-                                    cls="px-6 py-4 whitespace-nowrap text-sm font-medium",
-                                ),
-                            )
-                            for user in users
-                        ]
-                    ),
-                    cls="min-w-full divide-y divide-gray-200",
+        # Breadcrumb 생성
+        breadcrumb = AdminBreadcrumb([
+            {"label": "관리자", "url": "/admin"},
+            {"label": "사용자 관리"}
+        ])
+
+        # AdminTable을 위한 헤더와 데이터 준비
+        headers = ["ID", "이메일", "사용자명", "역할", "상태", "가입일"]
+        
+        # 테이블 행 데이터 생성
+        table_rows = []
+        for user in users:
+            # 상태 뱃지
+            status_badge = Span(
+                "활성" if user.is_active else "비활성",
+                cls=f"px-2 inline-flex text-xs leading-5 font-semibold rounded-full {'bg-green-100 text-green-800' if user.is_active else 'bg-red-100 text-red-800'}"
+            )
+            
+            # 액션 버튼들
+            action_buttons = Div(
+                Button(
+                    "권한 보기",
+                    **{"hx-get": f"/admin/users/{user.id}/permissions", "hx-target": "body", "hx-push-url": "true"},
+                    cls="text-blue-600 hover:text-blue-900 text-sm font-medium mr-2"
                 ),
-                cls="bg-white shadow overflow-hidden sm:rounded-lg",
+                Button(
+                    "역할 변경",
+                    cls="text-green-600 hover:text-green-900 text-sm font-medium",
+                    **{
+                        "hx-get": f"/admin/users/{user.id}/modal/roles",
+                        "hx-target": "#modalContainer",
+                        "hx-swap": "innerHTML"
+                    }
+                ),
+                cls="flex space-x-2"
+            )
+            
+            # 행 데이터 구성
+            row_data = [
+                str(user.id),
+                user.email,
+                user.username or "-",
+                Span(
+                    ", ".join(user.roles),
+                    id=f"userRoles_{user.id}"
+                ),
+                status_badge,
+                user.created_at.strftime("%Y-%m-%d"),
+                action_buttons
+            ]
+            
+            table_rows.append(row_data)
+
+        # AdminTable 컴포넌트 사용
+        users_table = AdminTable(
+            headers=headers,
+            rows=table_rows,
+            table_id="users-table",
+            empty_message="등록된 사용자가 없습니다.",
+            css_classes="users-admin-table"
+        )
+
+        # 테이블 컨테이너 (HTMX 업데이트를 위한 래퍼)
+        table_container = Div(
+            users_table,
+            id="users-table-container",
+            cls="bg-white shadow overflow-hidden sm:rounded-lg"
+        )
+
+        # 사용자 통계 카드들
+        total_users = len(users)
+        active_users = len([u for u in users if u.is_active])
+        admin_users = len([u for u in users if "admin" in u.roles])
+        
+        stats_section = Div(
+            StatsCard(
+                title="총 사용자",
+                value=total_users,
+                color="blue",
+                icon="👥"
             ),
-            # 역할 변경 모달 (Alpine.js)
-            Script("""
-                function openRoleModal(userId, email, currentRoles) {
-                    // TODO: 모달 구현
-                    alert(`사용자 ${email}의 역할 변경 기능은 곧 구현될 예정입니다.`);
+            StatsCard(
+                title="활성 사용자",
+                value=active_users,
+                color="green",
+                icon="✅"
+            ),
+            StatsCard(
+                title="관리자",
+                value=admin_users,
+                color="purple",
+                icon="👑"
+            ),
+            cls="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8"
+        )
+
+        # 필터/검색 바 (향후 확장용)
+        filter_section = FilterBar(
+            filters=[
+                {
+                    "name": "role_filter",
+                    "label": "역할별 필터",
+                    "options": [
+                        {"value": "admin", "label": "관리자"},
+                        {"value": "user", "label": "일반 사용자"},
+                        {"value": "guest", "label": "게스트"}
+                    ]
+                },
+                {
+                    "name": "status_filter", 
+                    "label": "상태별 필터",
+                    "options": [
+                        {"value": "active", "label": "활성"},
+                        {"value": "inactive", "label": "비활성"}
+                    ]
                 }
-            """),
+            ],
+            search_placeholder="이메일 또는 사용자명으로 검색...",
+            htmx_target="#users-table-container",
+            htmx_endpoint="/admin/users/filter",
+            container_id="users-filter-bar"
+        )
+
+        content = Div(
+            # Notification area for HTMX messages
+            Div(id="notification-area", cls="mb-4"),
+            
+            breadcrumb,
+            H1("사용자 관리", cls="text-3xl font-bold text-gray-900 mb-8"),
+            
+            # 통계 섹션
+            stats_section,
+            
+            # 사용자 관리 카드
+            AdminCard(
+                title="사용자 목록",
+                content=Div(
+                    # 필터/검색 섹션 (접을 수 있음)
+                    Details(
+                        Summary(
+                            "필터 및 검색",
+                            cls="cursor-pointer text-blue-600 hover:text-blue-800 font-medium mb-4"
+                        ),
+                        filter_section,
+                        cls="mb-6"
+                    ),
+                    
+                    # 사용자 테이블
+                    table_container
+                ),
+                actions=[
+                    Button(
+                        "+ 새 사용자 추가",
+                        cls="bg-green-500 hover:bg-green-600 text-white font-medium py-2 px-4 rounded-lg",
+                        **{"hx-get": "/admin/placeholder/add-user", "hx-target": "#notification-area", "hx-swap": "afterbegin"}
+                    ),
+                    A(
+                        "📊 사용자 내보내기",
+                        href="/admin/export/users.csv",
+                        cls="bg-blue-500 hover:bg-blue-600 text-white font-medium py-2 px-4 rounded-lg inline-block text-center",
+                        download="users.csv"
+                    )
+                ]
+            ),
+            
+            # 모달 컨테이너
+            Div(id="modalContainer"),
+            
         )
 
         page = create_layout("사용자 관리", content, current_user)
@@ -2372,6 +3489,290 @@ async def admin_users_page(
         return HTMLResponse(content=html_content)
 
 
+@app.get("/admin/users/{user_id}/modal/roles", response_class=HTMLResponse)
+async def get_role_change_modal(
+    user_id: str,
+    current_user: Annotated[UserResponse, Depends(require_admin)],
+    auth_service: Annotated[SQLiteAuthService, Depends(get_sqlite_auth_service)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    """사용자 역할 변경 모달 콘텐츠 반환"""
+    try:
+        # 사용자 조회
+        from .repositories.sqlite_user_repository import SQLiteUserRepository
+        
+        repository = SQLiteUserRepository(db)
+        user = await repository.get_by_id(user_id)
+        
+        if not user:
+            return HTMLResponse(
+                content=f'<div class="text-red-600">사용자를 찾을 수 없습니다: {user_id}</div>',
+                status_code=404
+            )
+        
+        # 사용 가능한 역할 목록
+        available_roles = ["admin", "user", "guest", "viewer", "analyst"]
+        current_roles = user.roles
+        
+        # 모달 콘텐츠 생성
+        modal_content = Div(
+            # 모달 배경
+            Div(
+                id="roleModalOverlay",
+                cls="fixed inset-0 bg-gray-600 bg-opacity-50 z-40",
+                **{"hx-get": "/admin/users/modal/close", "hx-trigger": "click", "hx-target": "#roleChangeModal", "hx-swap": "outerHTML"}
+            ),
+            # 모달 콘텐츠
+            Div(
+                Div(
+                    # 모달 헤더
+                    Div(
+                        H3(
+                            f"사용자 역할 변경: {user.email}",
+                            cls="text-lg font-medium text-gray-900"
+                        ),
+                        Button(
+                            "×",
+                            cls="text-gray-400 hover:text-gray-600 text-xl font-bold",
+                            **{"hx-get": "/admin/users/modal/close", "hx-target": "#roleChangeModal", "hx-swap": "outerHTML"}
+                        ),
+                        cls="flex justify-between items-center pb-3 border-b border-gray-200"
+                    ),
+                    
+                    # 모달 본문
+                    Form(
+                        Div(
+                            P(
+                                "이 사용자에게 부여할 역할을 선택하세요:",
+                                cls="text-sm text-gray-600 mb-4"
+                            ),
+                            # 역할 선택 체크박스
+                            *[
+                                Div(
+                                    Label(
+                                        Input(
+                                            type="checkbox",
+                                            name="roles",
+                                            value=role,
+                                            checked=role in current_roles,
+                                            cls="h-4 w-4 text-blue-600 focus:ring-blue-500 border-gray-300 rounded"
+                                        ),
+                                        Span(
+                                            role.capitalize(),
+                                            cls="ml-2 text-sm text-gray-900"
+                                        ),
+                                        cls="flex items-center"
+                                    ),
+                                    cls="mb-2"
+                                )
+                                for role in available_roles
+                            ],
+                            cls="space-y-2"
+                        ),
+                        Input(type="hidden", name="user_id", value=user_id),
+                        cls="py-4"
+                    ),
+                    
+                    # 모달 푸터
+                    Div(
+                        Button(
+                            "취소",
+                            type="button",
+                            cls="px-4 py-2 text-sm font-medium text-gray-700 bg-white border border-gray-300 rounded-md hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 mr-3",
+                            **{"hx-get": "/admin/users/modal/close", "hx-target": "#roleChangeModal", "hx-swap": "outerHTML"}
+                        ),
+                        Button(
+                            "저장",
+                            type="submit",
+                            cls="px-4 py-2 text-sm font-medium text-white bg-blue-600 border border-transparent rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500",
+                            **{
+                                "hx-put": f"/admin/users/{user_id}/roles/update",
+                                "hx-include": "closest form",
+                                "hx-target": "#roleChangeModal",
+                                "hx-swap": "outerHTML"
+                            }
+                        ),
+                        cls="flex justify-end pt-3 border-t border-gray-200"
+                    ),
+                    cls="bg-white rounded-lg p-6 max-w-md w-full mx-4"
+                ),
+                cls="fixed inset-0 z-50 flex items-center justify-center"
+            ),
+            id="roleChangeModal",
+            cls="fixed inset-0 z-40"
+        )
+        
+        return HTMLResponse(content=to_xml(modal_content))
+        
+    except Exception as e:
+        logger.error("역할 변경 모달 로딩 실패", error=str(e), user_id=user_id)
+        error_content = Div(
+            f"모달을 로드하는 중 오류가 발생했습니다: {str(e)}",
+            cls="text-red-600 p-4"
+        )
+        return HTMLResponse(content=to_xml(error_content), status_code=500)
+
+
+@app.get("/admin/users/modal/close", response_class=HTMLResponse)
+async def close_role_modal():
+    """역할 변경 모달 닫기"""
+    return HTMLResponse(content="")
+
+
+@app.put("/admin/users/{user_id}/roles/update", response_class=HTMLResponse)
+async def update_user_roles_htmx(
+    user_id: str,
+    request: Request,
+    current_user: Annotated[UserResponse, Depends(require_admin)],
+    auth_service: Annotated[SQLiteAuthService, Depends(get_sqlite_auth_service)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    """HTMX용 사용자 역할 업데이트"""
+    try:
+        # 폼 데이터 파싱
+        form = await request.form()
+        roles = form.getlist("roles")  # 체크박스에서 선택된 역할들
+        
+        # 기존 API 로직 재사용
+        user = await auth_service.user_repository.get_by_id(user_id)
+        if not user:
+            return HTMLResponse(
+                content='<div class="text-red-600 p-4">사용자를 찾을 수 없습니다.</div>',
+                status_code=404
+            )
+        
+        # 역할 업데이트
+        updated_user = await auth_service.user_repository.update(user_id, {"roles": roles})
+        
+        if not updated_user:
+            return HTMLResponse(
+                content='<div class="text-red-600 p-4">역할 업데이트에 실패했습니다.</div>',
+                status_code=500
+            )
+        
+        logger.info(
+            "사용자 역할 업데이트 (HTMX)",
+            admin_id=current_user.id,
+            user_id=user_id,
+            new_roles=roles,
+            old_roles=user.roles,
+        )
+        
+        # 성공 응답 - 모달 닫기 + 사용자 테이블 행 업데이트 트리거
+        # HTMX 응답: 모달을 닫고 성공 메시지 표시
+        success_message = Div(
+            "역할이 성공적으로 업데이트되었습니다.",
+            cls="text-green-600 p-3 bg-green-50 rounded mb-4"
+        )
+        
+        return HTMLResponse(
+            content=to_xml(success_message),
+            headers={
+                "HX-Trigger": f"userUpdated-{user_id}",  # 사용자 테이블 업데이트 트리거
+                "HX-Refresh": "true"  # 페이지 새로고침
+            }
+        )
+        
+    except Exception as e:
+        logger.error("역할 업데이트 실패 (HTMX)", error=str(e), user_id=user_id)
+        error_response = Div(
+            f"역할 업데이트 중 오류가 발생했습니다: {str(e)}",
+            cls="text-red-600 p-4"
+        )
+        return HTMLResponse(content=to_xml(error_response), status_code=500)
+
+
+@app.get("/admin/users/{user_id}/row/refresh", response_class=HTMLResponse)
+async def refresh_user_row(
+    user_id: str,
+    current_user: Annotated[UserResponse, Depends(require_admin)],
+    auth_service: Annotated[SQLiteAuthService, Depends(get_sqlite_auth_service)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    """사용자 테이블 행 새로고침"""
+    try:
+        # 사용자 조회
+        from .repositories.sqlite_user_repository import SQLiteUserRepository
+        
+        repository = SQLiteUserRepository(db)
+        user = await repository.get_by_id(user_id)
+        
+        if not user:
+            return HTMLResponse(
+                content=f'<tr><td colspan="7" class="text-red-600 text-center p-4">사용자를 찾을 수 없습니다: {user_id}</td></tr>',
+                status_code=404
+            )
+        
+        # 업데이트된 사용자 행 생성
+        user_row = Tr(
+            Td(
+                str(user.id),
+                cls="px-6 py-4 whitespace-nowrap text-sm text-gray-900",
+            ),
+            Td(
+                user.email,
+                cls="px-6 py-4 whitespace-nowrap text-sm text-gray-900",
+            ),
+            Td(
+                user.username or "-",
+                cls="px-6 py-4 whitespace-nowrap text-sm text-gray-900",
+            ),
+            Td(
+                ", ".join(user.roles),
+                cls="px-6 py-4 whitespace-nowrap text-sm text-gray-900",
+                id=f"userRoles_{user.id}"
+            ),
+            Td(
+                Span(
+                    "활성" if user.is_active else "비활성",
+                    cls=f"px-2 inline-flex text-xs leading-5 font-semibold rounded-full {'bg-green-100 text-green-800' if user.is_active else 'bg-red-100 text-red-800'}",
+                ),
+                cls="px-6 py-4 whitespace-nowrap",
+            ),
+            Td(
+                user.created_at.strftime("%Y-%m-%d"),
+                cls="px-6 py-4 whitespace-nowrap text-sm text-gray-900",
+            ),
+            Td(
+                Button(
+                    "권한 보기",
+                    **{"hx-get": f"/admin/users/{user.id}/permissions", "hx-target": "body", "hx-push-url": "true"},
+                    cls="text-blue-600 hover:text-blue-900 text-sm font-medium mr-2",
+                ),
+                Button(
+                    "역할 변경",
+                    cls="text-green-600 hover:text-green-900 text-sm font-medium",
+                    **{
+                        "hx-get": f"/admin/users/{user.id}/modal/roles",
+                        "hx-target": "#modalContainer",
+                        "hx-swap": "innerHTML"
+                    }
+                ),
+                cls="px-6 py-4 whitespace-nowrap text-sm font-medium",
+            ),
+            id=f"userRow_{user.id}",
+            **{
+                "hx-get": f"/admin/users/{user.id}/row/refresh",
+                "hx-trigger": "userUpdated",
+                "hx-swap": "outerHTML"
+            }
+        )
+        
+        return HTMLResponse(content=to_xml(user_row))
+        
+    except Exception as e:
+        logger.error("사용자 행 새로고침 실패", error=str(e), user_id=user_id)
+        error_row = Tr(
+            Td(
+                f"사용자 행 새로고침 중 오류가 발생했습니다: {str(e)}",
+                colspan="7",
+                cls="text-red-600 text-center p-4"
+            ),
+            id=f"userRow_{user_id}"
+        )
+        return HTMLResponse(content=to_xml(error_row), status_code=500)
+
+
 @app.get("/admin/permissions", response_class=HTMLResponse)
 async def admin_permissions_page(
     current_user: Annotated[UserResponse, Depends(require_admin)],
@@ -2379,116 +3780,185 @@ async def admin_permissions_page(
 ):
     """권한 관리 페이지"""
     try:
-        content = Div(
-            H1("권한 관리", cls="text-3xl font-bold text-gray-900 mb-8"),
-            # 권한 생성 폼
-            Div(
-                H2("새 권한 추가", cls="text-xl font-semibold text-gray-900 mb-4"),
-                Form(
-                    Div(
-                        Div(
-                            Label(
-                                "대상 타입",
-                                cls="block text-sm font-medium text-gray-700 mb-2",
-                            ),
-                            Select(
-                                Option("사용자별", value="user"),
-                                Option("역할별", value="role"),
-                                name="target_type",
-                                cls="block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500",
-                            ),
-                            cls="mb-4",
-                        ),
-                        Div(
-                            Label(
-                                "리소스 타입",
-                                cls="block text-sm font-medium text-gray-700 mb-2",
-                            ),
-                            Select(
-                                Option("웹 검색", value="web_search"),
-                                Option("벡터 DB", value="vector_db"),
-                                Option("데이터베이스", value="database"),
-                                name="resource_type",
-                                cls="block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500",
-                            ),
-                            cls="mb-4",
-                        ),
-                        cls="grid grid-cols-1 md:grid-cols-2 gap-4",
-                    ),
-                    Div(
-                        Label(
-                            "리소스 이름",
-                            cls="block text-sm font-medium text-gray-700 mb-2",
-                        ),
-                        Input(
-                            type="text",
-                            name="resource_name",
-                            placeholder="예: public.*, users.documents",
-                            cls="block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500",
-                        ),
-                        cls="mb-4",
-                    ),
-                    Div(
-                        Label(
-                            "권한", cls="block text-sm font-medium text-gray-700 mb-2"
-                        ),
-                        Div(
-                            Label(
-                                Input(
-                                    type="checkbox",
-                                    name="actions",
-                                    value="read",
-                                    cls="mr-2",
-                                ),
-                                "읽기",
-                                cls="inline-flex items-center mr-4",
-                            ),
-                            Label(
-                                Input(
-                                    type="checkbox",
-                                    name="actions",
-                                    value="write",
-                                    cls="mr-2",
-                                ),
-                                "쓰기",
-                                cls="inline-flex items-center mr-4",
-                            ),
-                            Label(
-                                Input(
-                                    type="checkbox",
-                                    name="actions",
-                                    value="delete",
-                                    cls="mr-2",
-                                ),
-                                "삭제",
-                                cls="inline-flex items-center",
-                            ),
-                            cls="flex flex-wrap",
-                        ),
-                        cls="mb-4",
-                    ),
-                    Button(
-                        "권한 추가",
-                        type="submit",
-                        cls="bg-blue-500 hover:bg-blue-600 text-white font-medium py-2 px-4 rounded-lg",
-                    ),
-                    method="post",
-                    action="/admin/permissions/create",
-                    cls="space-y-4",
-                ),
-                cls="bg-white rounded-lg shadow-md p-6 mb-8",
+        # Breadcrumb 생성
+        breadcrumb = AdminBreadcrumb([
+            {"label": "관리자", "url": "/admin"},
+            {"label": "권한 관리"}
+        ])
+
+        # 권한 생성 폼 필드 정의
+        permission_form_fields = [
+            {
+                "name": "target_type",
+                "label": "대상 타입",
+                "type": "select",
+                "options": [
+                    {"value": "user", "label": "사용자별"},
+                    {"value": "role", "label": "역할별"}
+                ],
+                "required": True
+            },
+            {
+                "name": "resource_type", 
+                "label": "리소스 타입",
+                "type": "select",
+                "options": [
+                    {"value": "web_search", "label": "웹 검색"},
+                    {"value": "vector_db", "label": "벡터 DB"}, 
+                    {"value": "database", "label": "데이터베이스"}
+                ],
+                "required": True
+            },
+            {
+                "name": "resource_name",
+                "label": "리소스 이름",
+                "type": "text",
+                "placeholder": "예: public.*, users.documents",
+                "required": True
+            },
+            {
+                "name": "actions",
+                "label": "권한",
+                "type": "checkbox",
+                "options": [
+                    {"value": "read", "label": "읽기"},
+                    {"value": "write", "label": "쓰기"},
+                    {"value": "delete", "label": "삭제"}
+                ]
+            }
+        ]
+
+        # AdminForm 컴포넌트 사용
+        permission_form = AdminForm(
+            fields=permission_form_fields,
+            action="/admin/permissions/create",
+            method="POST",
+            submit_text="권한 추가",
+            form_id="permission-create-form",
+            grid_cols=2
+        )
+
+        # 권한 생성 카드
+        create_permission_card = AdminCard(
+            title="새 권한 추가",
+            content=permission_form,
+            color="white"
+        )
+
+        # 필터링 섹션을 Details로 구성
+        filter_section = Details(
+            Summary(
+                "🔍 필터 옵션",
+                cls="cursor-pointer text-blue-600 hover:text-blue-800 font-medium mb-4 flex items-center"
             ),
-            # 기존 권한 목록
             Div(
-                H2("기존 권한 목록", cls="text-xl font-semibold text-gray-900 mb-4"),
-                P("권한 목록을 보려면 API를 통해 조회하세요.", cls="text-gray-600"),
+                LoadingSpinner(size="sm", color="blue"),
+                " 필터 옵션을 불러오는 중...",
+                **{
+                    "hx-get": "/admin/permissions/filters",
+                    "hx-trigger": "load",
+                    "hx-target": "this",
+                },
+                cls="mb-6 p-4 bg-gray-50 rounded-lg"
+            ),
+            cls="mb-6"
+        )
+
+        # 권한 테이블 컨테이너
+        permissions_table_container = Div(
+            Div(
+                LoadingSpinner(size="md", color="blue"),
+                P("권한 목록을 불러오는 중...", cls="text-center text-gray-500 mt-4"),
+                cls="text-center py-8"
+            ),
+            **{
+                "hx-get": "/admin/permissions/table",
+                "hx-trigger": "load",
+                "hx-target": "this",
+            },
+            id="permissions-table-container"
+        )
+
+        # 기존 권한 목록 카드
+        permissions_list_card = AdminCard(
+            title="기존 권한 목록",
+            content=Div(
+                filter_section,
+                permissions_table_container
+            ),
+            actions=[
+                Button(
+                    "🔄 새로고침",
+                    **{
+                        "hx-get": "/admin/permissions/table",
+                        "hx-target": "#permissions-table-container",
+                    },
+                    cls="bg-blue-500 hover:bg-blue-600 text-white font-medium py-2 px-4 rounded-lg"
+                ),
                 A(
-                    "권한 API 보기",
-                    href="/docs#/default/list_resource_permissions_api_v1_permissions_resources_get",
-                    cls="inline-block bg-gray-500 hover:bg-gray-600 text-white font-medium py-2 px-4 rounded-lg mt-4",
+                    "📊 권한 내보내기",
+                    href="/admin/export/permissions.csv",
+                    cls="bg-green-500 hover:bg-green-600 text-white font-medium py-2 px-4 rounded-lg inline-block text-center",
+                    download="permissions.csv"
+                )
+            ],
+            color="white"
+        )
+
+        # 권한 관리 도움말 카드
+        help_card = AdminCard(
+            title="권한 관리 가이드",
+            content=Div(
+                Div(
+                    Strong("🎯 대상 타입:"),
+                    Ul(
+                        Li("사용자별: 특정 사용자에게 권한 부여", cls="text-sm text-gray-600"),
+                        Li("역할별: 특정 역할에 속한 모든 사용자에게 권한 부여", cls="text-sm text-gray-600"),
+                        cls="ml-4 mt-2 space-y-1"
+                    ),
+                    cls="mb-4"
                 ),
-                cls="bg-white rounded-lg shadow-md p-6",
+                Div(
+                    Strong("📁 리소스 타입:"),
+                    Ul(
+                        Li("웹 검색: Tavily API를 통한 웹 검색 권한", cls="text-sm text-gray-600"),
+                        Li("벡터 DB: Qdrant 벡터 데이터베이스 접근 권한", cls="text-sm text-gray-600"),
+                        Li("데이터베이스: PostgreSQL 데이터베이스 접근 권한", cls="text-sm text-gray-600"),
+                        cls="ml-4 mt-2 space-y-1"
+                    ),
+                    cls="mb-4"
+                ),
+                Div(
+                    Strong("🔧 권한 종류:"),
+                    Ul(
+                        Li("읽기: 데이터 조회 및 검색", cls="text-sm text-gray-600"),
+                        Li("쓰기: 데이터 생성 및 수정", cls="text-sm text-gray-600"),
+                        Li("삭제: 데이터 삭제", cls="text-sm text-gray-600"),
+                        cls="ml-4 mt-2 space-y-1"
+                    )
+                )
             ),
+            color="blue"
+        )
+
+        content = Div(
+            # Notification area for HTMX messages
+            Div(id="notification-area", cls="mb-4"),
+            
+            breadcrumb,
+            H1("권한 관리", cls="text-3xl font-bold text-gray-900 mb-8"),
+            
+            # 권한 생성 섹션
+            create_permission_card,
+            
+            Div(cls="mb-8"),  # 구분선
+            
+            # 권한 목록 및 도움말 섹션
+            Div(
+                permissions_list_card,
+                help_card,
+                cls="grid grid-cols-1 lg:grid-cols-3 gap-6"
+            )
         )
 
         page = create_layout("권한 관리", content, current_user)
@@ -2509,6 +3979,311 @@ async def admin_permissions_page(
         return HTMLResponse(content=html_content)
 
 
+@app.get("/admin/permissions/table", response_class=HTMLResponse)
+async def admin_permissions_table(
+    current_user: Annotated[UserResponse, Depends(require_admin)],
+    permission_service=Depends(get_permission_service),
+    resource_type_filter: Optional[str] = None,
+    resource_name_filter: Optional[str] = None,
+    user_id_filter: Optional[int] = None,
+    role_name_filter: Optional[str] = None,
+    skip: int = 0,
+    limit: int = 50,
+):
+    """권한 목록 테이블 HTMX 엔드포인트"""
+    try:
+        # 기존 list_resource_permissions API와 동일한 로직 사용
+        if not permission_service.db_conn:
+            return Div(
+                P("데이터베이스 연결이 필요합니다.", cls="text-red-600 p-4"),
+                cls="text-center"
+            )
+
+        # 쿼리 조건 구성
+        conditions = []
+        params = []
+
+        # 필터 파라미터 처리
+        if resource_type_filter:
+            try:
+                resource_type = ResourceType(resource_type_filter)
+                conditions.append(f"resource_type = ${len(params) + 1}")
+                params.append(resource_type.value)
+            except ValueError:
+                pass  # 유효하지 않은 리소스 타입은 무시
+
+        if resource_name_filter:
+            conditions.append(f"resource_name ILIKE ${len(params) + 1}")
+            params.append(f"%{resource_name_filter}%")
+
+        if user_id_filter:
+            conditions.append(f"user_id = ${len(params) + 1}")
+            params.append(user_id_filter)
+
+        if role_name_filter:
+            conditions.append(f"role_name = ${len(params) + 1}")
+            params.append(role_name_filter)
+
+        where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+
+        # 총 개수 조회
+        count_query = f"""
+            SELECT COUNT(*) as total
+            FROM resource_permissions
+            {where_clause}
+        """
+        count_result = await permission_service.db_conn.fetchrow(count_query, *params[:len(params)-2] if params else [])
+        total_count = count_result["total"] if count_result else 0
+
+        # 권한 목록 조회
+        query = f"""
+            SELECT id, user_id, role_name, resource_type, resource_name, 
+                   actions, conditions, granted_at, granted_by, expires_at
+            FROM resource_permissions
+            {where_clause}
+            ORDER BY granted_at DESC
+            LIMIT ${len(params) + 1} OFFSET ${len(params) + 2}
+        """
+        params.extend([limit, skip])
+
+        rows = await permission_service.db_conn.fetch(query, *params)
+
+        # HTML 테이블 생성
+        permission_rows = []
+        for row in rows:
+            actions_str = ", ".join([a for a in row["actions"]])
+            granted_date = row["granted_at"].strftime("%Y-%m-%d %H:%M") if row["granted_at"] else ""
+            expires_date = row["expires_at"].strftime("%Y-%m-%d") if row["expires_at"] else "무제한"
+            
+            # 대상 표시 (사용자 또는 역할)
+            target = row["role_name"] if row["role_name"] else f"사용자 ID: {row['user_id']}"
+            
+            permission_rows.append(
+                Tr(
+                    Td(target, cls="px-6 py-4 whitespace-nowrap text-sm text-gray-900"),
+                    Td(row["resource_type"], cls="px-6 py-4 whitespace-nowrap text-sm text-gray-900"),
+                    Td(row["resource_name"], cls="px-6 py-4 whitespace-nowrap text-sm text-gray-900"),
+                    Td(actions_str, cls="px-6 py-4 whitespace-nowrap text-sm text-gray-900"),
+                    Td(granted_date, cls="px-6 py-4 whitespace-nowrap text-sm text-gray-500"),
+                    Td(expires_date, cls="px-6 py-4 whitespace-nowrap text-sm text-gray-500"),
+                    Td(
+                        Button(
+                            "삭제",
+                            **{
+                                "hx-delete": f"/admin/permissions/{row['id']}",
+                                "hx-target": "#permissions-table",
+                                "hx-confirm": "이 권한을 삭제하시겠습니까?",
+                            },
+                            cls="text-red-600 hover:text-red-900 text-sm font-medium"
+                        ),
+                        cls="px-6 py-4 whitespace-nowrap text-sm font-medium"
+                    ),
+                    cls="hover:bg-gray-50"
+                )
+            )
+
+        # 페이지네이션 정보
+        has_next = skip + limit < total_count
+        has_prev = skip > 0
+        current_page = (skip // limit) + 1
+        total_pages = (total_count + limit - 1) // limit
+
+        table_content = Div(
+            # 테이블 헤더와 데이터
+            Table(
+                Thead(
+                    Tr(
+                        Th("대상", cls="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider"),
+                        Th("리소스 타입", cls="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider"),
+                        Th("리소스 이름", cls="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider"),
+                        Th("권한", cls="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider"),
+                        Th("부여일", cls="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider"),
+                        Th("만료일", cls="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider"),
+                        Th("액션", cls="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider"),
+                        cls="bg-gray-50"
+                    )
+                ),
+                Tbody(
+                    *permission_rows if permission_rows else [
+                        Tr(
+                            Td(
+                                "권한이 없습니다.", 
+                                colspan="7", 
+                                cls="px-6 py-4 text-center text-gray-500"
+                            )
+                        )
+                    ],
+                    cls="bg-white divide-y divide-gray-200"
+                ),
+                cls="min-w-full divide-y divide-gray-200"
+            ),
+            # 페이지네이션
+            Div(
+                Div(
+                    P(f"총 {total_count}개 권한 중 {skip + 1}-{min(skip + limit, total_count)}번째 표시", 
+                      cls="text-sm text-gray-700"),
+                    cls="flex-1"
+                ),
+                Div(
+                    Button(
+                        "이전",
+                        **{
+                            "hx-get": f"/admin/permissions/table?skip={max(0, skip - limit)}&limit={limit}",
+                            "hx-target": "#permissions-table",
+                            "hx-include": "#permissions-filters",
+                        },
+                        disabled=not has_prev,
+                        cls="mr-2 px-3 py-1 text-sm bg-gray-300 hover:bg-gray-400 text-gray-700 rounded disabled:opacity-50"
+                    ),
+                    Span(f"페이지 {current_page} / {total_pages}", cls="mx-2 text-sm text-gray-700"),
+                    Button(
+                        "다음",
+                        **{
+                            "hx-get": f"/admin/permissions/table?skip={skip + limit}&limit={limit}",
+                            "hx-target": "#permissions-table", 
+                            "hx-include": "#permissions-filters",
+                        },
+                        disabled=not has_next,
+                        cls="ml-2 px-3 py-1 text-sm bg-gray-300 hover:bg-gray-400 text-gray-700 rounded disabled:opacity-50"
+                    ),
+                    cls="flex items-center"
+                ),
+                cls="flex items-center justify-between mt-4"
+            ),
+            id="permissions-table"
+        )
+
+        return table_content
+
+    except Exception as e:
+        logger.error("권한 테이블 로딩 실패", error=str(e))
+        return Div(
+            P(f"권한 목록을 불러오는 중 오류가 발생했습니다: {str(e)}", cls="text-red-600 p-4"),
+            cls="text-center"
+        )
+
+
+@app.delete("/admin/permissions/{permission_id}", response_class=HTMLResponse)
+async def delete_permission(
+    permission_id: int,
+    current_user: Annotated[UserResponse, Depends(require_admin)],
+    permission_service=Depends(get_permission_service),
+):
+    """권한 삭제 HTMX 엔드포인트"""
+    try:
+        if not permission_service.db_conn:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="데이터베이스 연결이 필요합니다",
+            )
+
+        # 권한 삭제
+        delete_query = "DELETE FROM resource_permissions WHERE id = $1"
+        result = await permission_service.db_conn.execute(delete_query, permission_id)
+        
+        if result == "DELETE 0":
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="권한을 찾을 수 없습니다",
+            )
+
+        logger.info("권한 삭제", permission_id=permission_id, admin_user=current_user.email)
+        
+        # 테이블 새로고침을 위해 HTMX 응답으로 업데이트된 테이블 반환
+        return await admin_permissions_table(current_user, permission_service)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("권한 삭제 실패", permission_id=permission_id, error=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="권한 삭제에 실패했습니다",
+        )
+
+
+@app.get("/admin/permissions/filters", response_class=HTMLResponse)
+async def admin_permissions_filters(
+    current_user: Annotated[UserResponse, Depends(require_admin)],
+):
+    """권한 필터링 UI 컴포넌트"""
+    return Div(
+        Div(
+            Div(
+                Label("리소스 타입", cls="block text-sm font-medium text-gray-700 mb-2"),
+                Select(
+                    Option("전체", value=""),
+                    Option("웹 검색", value="web_search"),
+                    Option("벡터 DB", value="vector_db"),
+                    Option("데이터베이스", value="database"),
+                    name="resource_type_filter",
+                    **{
+                        "hx-get": "/admin/permissions/table",
+                        "hx-target": "#permissions-table",
+                        "hx-trigger": "change",
+                        "hx-include": "#permissions-filters",
+                    },
+                    cls="block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500",
+                ),
+                cls="mb-4"
+            ),
+            Div(
+                Label("리소스 이름", cls="block text-sm font-medium text-gray-700 mb-2"),
+                Input(
+                    type="text",
+                    name="resource_name_filter",
+                    placeholder="리소스 이름으로 검색...",
+                    **{
+                        "hx-get": "/admin/permissions/table",
+                        "hx-target": "#permissions-table",
+                        "hx-trigger": "keyup changed delay:500ms",
+                        "hx-include": "#permissions-filters",
+                    },
+                    cls="block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500",
+                ),
+                cls="mb-4"
+            ),
+            cls="grid grid-cols-1 md:grid-cols-2 gap-4"
+        ),
+        Div(
+            Div(
+                Label("역할명", cls="block text-sm font-medium text-gray-700 mb-2"),
+                Input(
+                    type="text",
+                    name="role_name_filter",
+                    placeholder="역할명으로 검색...",
+                    **{
+                        "hx-get": "/admin/permissions/table",
+                        "hx-target": "#permissions-table",
+                        "hx-trigger": "keyup changed delay:500ms",
+                        "hx-include": "#permissions-filters",
+                    },
+                    cls="block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500",
+                ),
+                cls="mb-4"
+            ),
+            Div(
+                Label("사용자 ID", cls="block text-sm font-medium text-gray-700 mb-2"),
+                Input(
+                    type="number",
+                    name="user_id_filter",
+                    placeholder="사용자 ID로 검색...",
+                    **{
+                        "hx-get": "/admin/permissions/table",
+                        "hx-target": "#permissions-table",
+                        "hx-trigger": "keyup changed delay:500ms",
+                        "hx-include": "#permissions-filters",
+                    },
+                    cls="block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500",
+                ),
+                cls="mb-4"
+            ),
+            cls="grid grid-cols-1 md:grid-cols-2 gap-4"
+        ),
+        id="permissions-filters"
+    )
+
+
 @app.get("/admin/roles", response_class=HTMLResponse)
 async def admin_roles_page(
     current_user: Annotated[UserResponse, Depends(require_admin)],
@@ -2516,6 +4291,9 @@ async def admin_roles_page(
 ):
     """역할 관리 페이지"""
     try:
+        # 컴포넌트 라이브러리 import 추가
+        from .components import AdminForm, AdminCard, StatsCard, AdminBreadcrumb
+        
         # 역할 목록 조회
         roles = []
         for role_name, permissions in rbac_service.role_permissions.items():
@@ -2527,82 +4305,154 @@ async def admin_roles_page(
                 }
             )
 
+        # Breadcrumb 생성
+        breadcrumb_items = [
+            {"label": "관리자", "url": "/admin"},
+            {"label": "역할 관리"}
+        ]
+
         content = Div(
+            # Breadcrumb
+            AdminBreadcrumb(breadcrumb_items),
+            
             H1("역할 관리", cls="text-3xl font-bold text-gray-900 mb-8"),
-            # 역할 생성 폼
+            
+            # 통계 카드
             Div(
-                H2("새 역할 추가", cls="text-xl font-semibold text-gray-900 mb-4"),
-                Form(
-                    Div(
-                        Label(
-                            "역할 이름",
-                            cls="block text-sm font-medium text-gray-700 mb-2",
-                        ),
-                        Input(
-                            type="text",
-                            name="name",
-                            placeholder="예: editor, viewer",
-                            cls="block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500",
-                        ),
-                        cls="mb-4",
-                    ),
-                    Div(
-                        Label(
-                            "설명 (선택사항)",
-                            cls="block text-sm font-medium text-gray-700 mb-2",
-                        ),
-                        Textarea(
-                            name="description",
-                            placeholder="역할에 대한 설명을 입력하세요",
-                            rows="3",
-                            cls="block w-full px-3 py-2 border border-gray-300 rounded-md shadow-sm focus:outline-none focus:ring-blue-500 focus:border-blue-500",
-                        ),
-                        cls="mb-4",
-                    ),
-                    Button(
-                        "역할 생성",
-                        type="submit",
-                        cls="bg-green-500 hover:bg-green-600 text-white font-medium py-2 px-4 rounded-lg",
-                    ),
-                    method="post",
+                StatsCard(
+                    title="총 역할 수",
+                    value=len(roles),
+                    color="blue",
+                    icon="👥",
+                    subtitle="시스템에 등록된 역할"
+                ),
+                StatsCard(
+                    title="활성 권한",
+                    value=sum(len(role["permissions"]) for role in roles),
+                    color="green", 
+                    icon="🔐",
+                    subtitle="할당된 권한 총합"
+                ),
+                StatsCard(
+                    title="기본 역할",
+                    value="3",
+                    color="purple",
+                    icon="⭐",
+                    subtitle="admin, user, guest"
+                ),
+                cls="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8"
+            ),
+            
+            # 새 역할 추가 카드
+            AdminCard(
+                title="새 역할 추가",
+                content=AdminForm(
+                    fields=[
+                        {
+                            "name": "name",
+                            "label": "역할 이름",
+                            "type": "text",
+                            "placeholder": "예: editor, viewer",
+                            "required": True
+                        },
+                        {
+                            "name": "description", 
+                            "label": "설명 (선택사항)",
+                            "type": "textarea",
+                            "placeholder": "역할에 대한 설명을 입력하세요",
+                            "rows": 3
+                        }
+                    ],
                     action="/admin/roles/create",
-                    cls="space-y-4",
+                    method="POST",
+                    submit_text="역할 생성",
+                    form_id="create-role-form"
                 ),
-                cls="bg-white rounded-lg shadow-md p-6 mb-8",
+                color="white"
             ),
-            # 기존 역할 목록
+            
+            # 역할 목록 카드
+            AdminCard(
+                title="역할 목록",
+                content=Div(
+                    # 역할 테이블 컨테이너
+                    Div(
+                        Div(
+                            "역할 목록을 불러오는 중...",
+                            cls="text-center py-8 text-gray-500"
+                        ),
+                        **{
+                            "hx-get": "/admin/roles/table",
+                            "hx-trigger": "load",
+                            "hx-target": "this",
+                        },
+                        id="roles-table-container",
+                        cls="mb-6"
+                    )
+                ),
+                color="white"
+            ),
+            
+            # 역할 권한 상세 정보 영역
             Div(
-                H2("기존 역할 목록", cls="text-xl font-semibold text-gray-900 mb-4"),
-                Div(
-                    P(f"총 {len(roles)}개의 역할이 있습니다.", cls="text-gray-600"),
-                    cls="bg-white rounded-lg shadow-md p-6",
-                ),
+                id="role-permissions-detail",
+                cls="mb-8"
             ),
-            # JavaScript 함수들
-            Script("""
-                function editRole(roleName) {
-                    alert(`역할 '${roleName}' 수정 기능은 곧 구현될 예정입니다.`);
-                }
-                
-                function deleteRole(roleName) {
-                    if (confirm(`정말로 역할 '${roleName}'을 삭제하시겠습니까?`)) {
-                        fetch(`/api/v1/roles/${roleName}`, {
-                            method: 'DELETE',
-                            headers: {
-                                'Authorization': 'Bearer ' + localStorage.getItem('access_token')
-                            }
-                        })
-                        .then(response => response.json())
-                        .then(data => {
-                            alert('역할이 삭제되었습니다.');
-                            location.reload();
-                        })
-                        .catch(error => {
-                            alert('역할 삭제 중 오류가 발생했습니다.');
-                        });
-                    }
-                }
-            """),
+            
+            # 권한 매트릭스 카드
+            AdminCard(
+                title="권한 매트릭스",
+                content=Div(
+                    P("각 역할별 리소스 및 도구 접근 권한을 한 눈에 확인할 수 있습니다.", cls="text-gray-600 mb-4"),
+                    
+                    # 매트릭스 토글 버튼
+                    Details(
+                        Summary(
+                            "권한 매트릭스 보기/숨기기",
+                            cls="cursor-pointer text-blue-600 hover:text-blue-800 font-medium mb-4"
+                        ),
+                        Div(
+                            Div(
+                                "권한 매트릭스를 불러오는 중...",
+                                cls="text-center py-8 text-gray-500"
+                            ),
+                            **{
+                                "hx-get": "/admin/roles/matrix",
+                                "hx-trigger": "intersect once",
+                                "hx-target": "this",
+                            },
+                            id="roles-matrix-container"
+                        ),
+                        cls="mb-6"
+                    )
+                ),
+                color="white"
+            ),
+            
+            # 역할 별칭 정보 카드
+            AdminCard(
+                title="역할 별칭 정보",
+                content=Ul(
+                    Li(
+                        Strong("viewer"), " → ", Strong("guest"), 
+                        " : 웹 검색만 가능한 읽기 전용 역할",
+                        cls="mb-2"
+                    ),
+                    Li(
+                        Strong("analyst"), " → ", Strong("user"), 
+                        " : 모든 검색 및 기본 데이터 조작이 가능한 역할",
+                        cls="mb-2"
+                    ),
+                    cls="text-sm text-gray-700"
+                ),
+                color="blue"
+            ),
+            
+            # 역할 편집 모달 컨테이너
+            Div(
+                id="role-edit-modal",
+                cls="hidden"
+            ),
         )
 
         page = create_layout("역할 관리", content, current_user)
@@ -2621,6 +4471,623 @@ async def admin_roles_page(
         page = create_layout("오류", error_content, current_user)
         html_content = to_xml(page)
         return HTMLResponse(content=html_content)
+
+@app.get("/admin/roles/table", response_class=HTMLResponse)
+async def admin_roles_table(
+    current_user: Annotated[UserResponse, Depends(require_admin)],
+    rbac_service=Depends(get_rbac_service),
+):
+    """역할 테이블 HTMX 엔드포인트"""
+    try:
+        # 모든 역할 정보 수집
+        roles_data = []
+        for role_name, permissions in rbac_service.role_permissions.items():
+            # 해당 역할이 접근 가능한 도구들 확인
+            accessible_tools = []
+            for tool_name in rbac_service.tool_permissions.keys():
+                if rbac_service.check_tool_permission([role_name], tool_name):
+                    accessible_tools.append(tool_name)
+            
+            roles_data.append({
+                "name": role_name,
+                "permissions": permissions,
+                "permission_count": len(permissions),
+                "accessible_tools": accessible_tools,
+                "tool_count": len(accessible_tools)
+            })
+
+        # 역할 테이블 생성
+        role_rows = []
+        for role_data in roles_data:
+            # 역할 별칭 표시
+            aliases = []
+            if role_data["name"] == "guest":
+                aliases.append("viewer")
+            elif role_data["name"] == "user":
+                aliases.append("analyst")
+            
+            alias_text = f" (별칭: {', '.join(aliases)})" if aliases else ""
+            
+            # 권한 리소스별 요약
+            resources_summary = {}
+            for perm in role_data["permissions"]:
+                resource = perm.resource.value
+                action = perm.action.value
+                if resource not in resources_summary:
+                    resources_summary[resource] = []
+                resources_summary[resource].append(action)
+            
+            resources_text = ", ".join([
+                f"{res}({','.join(actions)})" 
+                for res, actions in resources_summary.items()
+            ])
+            
+            role_rows.append(
+                Tr(
+                    Td(
+                        Div(
+                            Strong(role_data["name"]),
+                            Span(alias_text, cls="text-sm text-gray-500") if alias_text else "",
+                            cls="flex flex-col"
+                        ),
+                        cls="px-6 py-4 whitespace-nowrap text-sm text-gray-900"
+                    ),
+                    Td(role_data["permission_count"], cls="px-6 py-4 whitespace-nowrap text-sm text-gray-900"),
+                    Td(
+                        Span(resources_text, cls="text-sm text-gray-700") if resources_text else "없음",
+                        cls="px-6 py-4 text-sm text-gray-900"
+                    ),
+                    Td(role_data["tool_count"], cls="px-6 py-4 whitespace-nowrap text-sm text-gray-900"),
+                    Td(
+                        Div(
+                            Button(
+                                "권한 보기",
+                                **{
+                                    "hx-get": f"/admin/roles/{role_data['name']}/permissions",
+                                    "hx-target": "#role-permissions-detail",
+                                    "hx-trigger": "click",
+                                },
+                                cls="mr-2 px-3 py-1 text-sm bg-blue-500 hover:bg-blue-600 text-white rounded"
+                            ),
+                            Button(
+                                "편집",
+                                **{
+                                    "hx-get": f"/admin/roles/{role_data['name']}/edit",
+                                    "hx-target": "#role-edit-modal",
+                                    "hx-trigger": "click",
+                                },
+                                cls="mr-2 px-3 py-1 text-sm bg-yellow-500 hover:bg-yellow-600 text-white rounded"
+                            ),
+                            Button(
+                                "삭제",
+                                **{
+                                    "hx-delete": f"/admin/roles/{role_data['name']}",
+                                    "hx-target": "#roles-table",
+                                    "hx-confirm": f"역할 '{role_data['name']}'을 정말 삭제하시겠습니까?",
+                                },
+                                cls="px-3 py-1 text-sm bg-red-500 hover:bg-red-600 text-white rounded",
+                                disabled=role_data["name"] in ["admin", "user"]  # 기본 역할은 삭제 불가
+                            ),
+                            cls="flex space-x-1"
+                        ),
+                        cls="px-6 py-4 whitespace-nowrap text-sm font-medium"
+                    ),
+                    cls="hover:bg-gray-50"
+                )
+            )
+
+        table_content = Table(
+            Thead(
+                Tr(
+                    Th("역할", cls="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider"),
+                    Th("권한 수", cls="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider"),
+                    Th("리소스 권한", cls="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider"),
+                    Th("도구 접근", cls="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider"),
+                    Th("액션", cls="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider"),
+                    cls="bg-gray-50"
+                )
+            ),
+            Tbody(
+                *role_rows if role_rows else [
+                    Tr(
+                        Td(
+                            "역할이 없습니다.", 
+                            colspan="5", 
+                            cls="px-6 py-4 text-center text-gray-500"
+                        )
+                    )
+                ],
+                cls="bg-white divide-y divide-gray-200"
+            ),
+            cls="min-w-full divide-y divide-gray-200",
+            id="roles-table"
+        )
+
+        return table_content
+
+    except Exception as e:
+        logger.error("역할 테이블 로딩 실패", error=str(e))
+        return Div(
+            P(f"역할 목록을 불러오는 중 오류가 발생했습니다: {str(e)}", cls="text-red-600 p-4"),
+            cls="text-center"
+        )
+
+
+@app.get("/admin/roles/matrix", response_class=HTMLResponse)
+async def admin_roles_matrix(
+    current_user: Annotated[UserResponse, Depends(require_admin)],
+    rbac_service=Depends(get_rbac_service),
+):
+    """권한 매트릭스 HTMX 엔드포인트"""
+    try:
+        from ..models import ResourceType, ActionType
+        
+        # 모든 리소스와 액션 조합
+        resources = [ResourceType.WEB_SEARCH, ResourceType.VECTOR_DB, ResourceType.DATABASE]
+        actions = [ActionType.READ, ActionType.WRITE]
+        
+        # 역할 목록
+        roles = list(rbac_service.role_permissions.keys())
+        
+        # 헤더 행 생성
+        header_cells = [Th("역할/리소스", cls="px-4 py-2 bg-gray-100 border text-xs font-medium text-gray-500 uppercase")]
+        for resource in resources:
+            for action in actions:
+                header_cells.append(
+                    Th(
+                        Div(
+                            Div(resource.value, cls="font-semibold"),
+                            Div(action.value, cls="text-xs"),
+                            cls="text-center"
+                        ),
+                        cls="px-2 py-2 bg-gray-100 border text-xs"
+                    )
+                )
+        
+        # 데이터 행 생성
+        matrix_rows = [Tr(*header_cells)]
+        
+        for role in roles:
+            cells = [Td(Strong(role), cls="px-4 py-2 border bg-gray-50 font-medium")]
+            
+            for resource in resources:
+                for action in actions:
+                    has_permission = rbac_service.check_permission([role], resource, action)
+                    icon = "✅" if has_permission else "❌"
+                    color_class = "text-green-600" if has_permission else "text-red-600"
+                    
+                    cells.append(
+                        Td(
+                            Span(icon, cls=f"{color_class} text-lg"),
+                            cls="px-2 py-2 border text-center"
+                        )
+                    )
+            
+            matrix_rows.append(Tr(*cells, cls="hover:bg-gray-50"))
+        
+        # 도구 접근 매트릭스
+        tool_header_cells = [Th("역할/도구", cls="px-4 py-2 bg-blue-100 border text-xs font-medium text-gray-500 uppercase")]
+        tools = list(rbac_service.tool_permissions.keys())
+        
+        for tool in tools:
+            tool_header_cells.append(
+                Th(
+                    tool.replace("_", " ").title(),
+                    cls="px-2 py-2 bg-blue-100 border text-xs text-center",
+                    style="writing-mode: vertical-lr; text-orientation: mixed;"
+                )
+            )
+        
+        tool_rows = [Tr(*tool_header_cells)]
+        
+        for role in roles:
+            cells = [Td(Strong(role), cls="px-4 py-2 border bg-blue-50 font-medium")]
+            
+            for tool in tools:
+                has_access = rbac_service.check_tool_permission([role], tool)
+                icon = "✅" if has_access else "❌"
+                color_class = "text-green-600" if has_access else "text-red-600"
+                
+                cells.append(
+                    Td(
+                        Span(icon, cls=f"{color_class} text-lg"),
+                        cls="px-2 py-2 border text-center"
+                    )
+                )
+            
+            tool_rows.append(Tr(*cells, cls="hover:bg-blue-50"))
+
+        matrix_content = Div(
+            H3("리소스 권한 매트릭스", cls="text-lg font-semibold mb-4"),
+            Div(
+                Table(
+                    *matrix_rows,
+                    cls="border-collapse border border-gray-300 text-sm"
+                ),
+                cls="overflow-x-auto mb-8"
+            ),
+            H3("도구 접근 권한 매트릭스", cls="text-lg font-semibold mb-4"),
+            Div(
+                Table(
+                    *tool_rows,
+                    cls="border-collapse border border-gray-300 text-sm"
+                ),
+                cls="overflow-x-auto"
+            ),
+            id="roles-matrix"
+        )
+
+        return matrix_content
+
+    except Exception as e:
+        logger.error("권한 매트릭스 로딩 실패", error=str(e))
+        return Div(
+            P(f"권한 매트릭스를 불러오는 중 오류가 발생했습니다: {str(e)}", cls="text-red-600 p-4"),
+            cls="text-center"
+        )
+
+
+@app.get("/admin/roles/{role_name}/permissions", response_class=HTMLResponse)
+async def role_permissions_detail(
+    role_name: str,
+    current_user: Annotated[UserResponse, Depends(require_admin)],
+    rbac_service=Depends(get_rbac_service),
+):
+    """특정 역할의 상세 권한 정보"""
+    try:
+        if role_name not in rbac_service.role_permissions:
+            return Div(P("역할을 찾을 수 없습니다.", cls="text-red-600 p-4"))
+        
+        permissions = rbac_service.role_permissions[role_name]
+        
+        # 권한별 상세 정보
+        permission_details = []
+        for perm in permissions:
+            permission_details.append(
+                Div(
+                    Span(f"리소스: {perm.resource.value}", cls="font-medium text-blue-600"),
+                    Span(f"액션: {perm.action.value}", cls="ml-4 text-gray-600"),
+                    cls="p-2 bg-gray-50 rounded mb-2"
+                )
+            )
+        
+        # 접근 가능한 도구들
+        accessible_tools = []
+        for tool_name in rbac_service.tool_permissions.keys():
+            if rbac_service.check_tool_permission([role_name], tool_name):
+                accessible_tools.append(
+                    Span(
+                        tool_name.replace("_", " ").title(),
+                        cls="inline-block px-2 py-1 bg-green-100 text-green-800 rounded text-sm mr-2 mb-2"
+                    )
+                )
+        
+        detail_content = Div(
+            H4(f"'{role_name}' 역할 상세 권한", cls="text-lg font-semibold mb-4"),
+            
+            Div(
+                H5("리소스 권한", cls="font-medium mb-2"),
+                *permission_details if permission_details else [P("권한이 없습니다.", cls="text-gray-500")],
+                cls="mb-6"
+            ),
+            
+            Div(
+                H5("접근 가능한 도구", cls="font-medium mb-2"),
+                Div(*accessible_tools) if accessible_tools else P("접근 가능한 도구가 없습니다.", cls="text-gray-500"),
+                cls="mb-4"
+            ),
+            
+            Button(
+                "닫기",
+                **{
+                    "hx-get": "/admin/roles/empty",
+                    "hx-target": "#role-permissions-detail",
+                },
+                cls="px-4 py-2 bg-gray-500 hover:bg-gray-600 text-white rounded"
+            ),
+            
+            cls="p-4 bg-white border rounded-lg shadow"
+        )
+        
+        return detail_content
+
+    except Exception as e:
+        logger.error("역할 권한 상세 조회 실패", role_name=role_name, error=str(e))
+        return Div(
+            P(f"권한 정보를 불러오는 중 오류가 발생했습니다: {str(e)}", cls="text-red-600 p-4"),
+            cls="text-center"
+        )
+
+
+@app.get("/admin/roles/empty", response_class=HTMLResponse)
+async def empty_content():
+    """빈 컨텐츠 반환"""
+    return Div("")
+
+
+@app.delete("/admin/roles/{role_name}", response_class=HTMLResponse)
+async def delete_role(
+    role_name: str,
+    current_user: Annotated[UserResponse, Depends(require_admin)],
+    rbac_service=Depends(get_rbac_service),
+):
+    """역할 삭제"""
+    try:
+        # 기본 역할은 삭제 불가
+        if role_name in ["admin", "user"]:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="기본 역할은 삭제할 수 없습니다",
+            )
+        
+        if role_name not in rbac_service.role_permissions:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="역할을 찾을 수 없습니다",
+            )
+        
+        # 역할 삭제 (현재는 메모리에서만)
+        del rbac_service.role_permissions[role_name]
+        
+        logger.info("역할 삭제", role_name=role_name, admin_user=current_user.email)
+        
+        # 업데이트된 테이블 반환
+        return await admin_roles_table(current_user, rbac_service)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("역할 삭제 실패", role_name=role_name, error=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="역할 삭제에 실패했습니다",
+        )
+
+@app.get("/admin/roles/{role_name}/edit", response_class=HTMLResponse)
+async def edit_role_modal(
+    role_name: str,
+    current_user: Annotated[UserResponse, Depends(require_admin)],
+    rbac_service=Depends(get_rbac_service),
+):
+    """역할 편집 모달"""
+    try:
+        if role_name not in rbac_service.role_permissions:
+            return Div(P("역할을 찾을 수 없습니다.", cls="text-red-600 p-4"))
+        
+        from ..models import ResourceType, ActionType
+        
+        current_permissions = rbac_service.role_permissions[role_name]
+        
+        # 모든 가능한 권한 조합
+        all_permissions = []
+        for resource in [ResourceType.WEB_SEARCH, ResourceType.VECTOR_DB, ResourceType.DATABASE]:
+            for action in [ActionType.READ, ActionType.WRITE]:
+                permission_key = f"{resource.value}_{action.value}"
+                is_checked = any(
+                    p.resource == resource and p.action == action 
+                    for p in current_permissions
+                )
+                all_permissions.append({
+                    "key": permission_key,
+                    "resource": resource,
+                    "action": action,
+                    "checked": is_checked,
+                    "label": f"{resource.value} - {action.value}"
+                })
+        
+        modal_content = Div(
+            # 모달 오버레이
+            Div(
+                # 모달 컨테이너
+                Div(
+                    # 모달 헤더
+                    Div(
+                        H3(f"'{role_name}' 역할 편집", cls="text-lg font-medium text-gray-900"),
+                        Button(
+                            "×",
+                            **{
+                                "hx-get": "/admin/roles/empty",
+                                "hx-target": "#role-edit-modal",
+                            },
+                            cls="text-gray-400 hover:text-gray-600 text-2xl font-bold"
+                        ),
+                        cls="flex justify-between items-center mb-4"
+                    ),
+                    
+                    # 모달 본문
+                    Form(
+                        Div(
+                            H4("리소스 권한", cls="font-medium mb-3"),
+                            Div(
+                                *[
+                                    Label(
+                                        Input(
+                                            type="checkbox",
+                                            name="permissions",
+                                            value=perm["key"],
+                                            checked=perm["checked"],
+                                            cls="mr-2"
+                                        ),
+                                        perm["label"],
+                                        cls="flex items-center mb-2 text-sm"
+                                    )
+                                    for perm in all_permissions
+                                ],
+                                cls="grid grid-cols-2 gap-2 mb-4"
+                            ),
+                            cls="mb-6"
+                        ),
+                        
+                        # 버튼
+                        Div(
+                            Button(
+                                "취소",
+                                type="button",
+                                **{
+                                    "hx-get": "/admin/roles/empty",
+                                    "hx-target": "#role-edit-modal",
+                                },
+                                cls="mr-2 px-4 py-2 bg-gray-300 hover:bg-gray-400 text-gray-700 rounded"
+                            ),
+                            Button(
+                                "저장",
+                                type="submit",
+                                cls="px-4 py-2 bg-blue-500 hover:bg-blue-600 text-white rounded"
+                            ),
+                            cls="flex justify-end"
+                        ),
+                        
+                        **{
+                            "hx-put": f"/admin/roles/{role_name}",
+                            "hx-target": "#roles-table-container",
+                            "hx-include": "this",
+                        },
+                        method="post"
+                    ),
+                    
+                    cls="bg-white rounded-lg p-6 max-w-md mx-auto mt-20 relative"
+                ),
+                cls="fixed inset-0 bg-gray-600 bg-opacity-50 overflow-y-auto h-full w-full",
+                id="role-modal-overlay",
+                **{
+                    "hx-get": "/admin/roles/empty",
+                    "hx-target": "#role-edit-modal",
+                    "hx-trigger": "click[target==this]",
+                }
+            ),
+            id="roleEditModal"
+        )
+        
+        return modal_content
+
+    except Exception as e:
+        logger.error("역할 편집 모달 로딩 실패", role_name=role_name, error=str(e))
+        return Div(
+            P(f"역할 편집 폼을 불러오는 중 오류가 발생했습니다: {str(e)}", cls="text-red-600 p-4"),
+            cls="text-center"
+        )
+
+
+@app.put("/admin/roles/{role_name}", response_class=HTMLResponse)
+async def update_role(
+    role_name: str,
+    request: Request,
+    current_user: Annotated[UserResponse, Depends(require_admin)],
+    rbac_service=Depends(get_rbac_service),
+):
+    """역할 권한 업데이트"""
+    try:
+        if role_name not in rbac_service.role_permissions:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="역할을 찾을 수 없습니다",
+            )
+        
+        # 폼 데이터 파싱
+        form_data = await request.form()
+        selected_permissions = form_data.getlist("permissions")
+        
+        from ..models import Permission, ResourceType, ActionType
+        
+        # 새로운 권한 목록 구성
+        new_permissions = []
+        for perm_key in selected_permissions:
+            try:
+                resource_str, action_str = perm_key.split("_")
+                resource = ResourceType(resource_str)
+                action = ActionType(action_str)
+                new_permissions.append(Permission(resource=resource, action=action))
+            except (ValueError, KeyError) as e:
+                logger.warning("유효하지 않은 권한", permission_key=perm_key, error=str(e))
+                continue
+        
+        # 권한 업데이트
+        rbac_service.role_permissions[role_name] = new_permissions
+        
+        logger.info(
+            "역할 권한 업데이트", 
+            role_name=role_name, 
+            new_permission_count=len(new_permissions),
+            admin_user=current_user.email
+        )
+        
+        # 모달 닫기 및 테이블 업데이트
+        return Div(
+            Div(
+                **{
+                    "hx-get": "/admin/roles/table",
+                    "hx-trigger": "load",
+                    "hx-target": "this",
+                },
+                cls="text-center py-8 text-gray-500"
+            ),
+            **{
+                "hx-get": "/admin/roles/empty",
+                "hx-target": "#role-edit-modal",
+                "hx-trigger": "load delay:100ms",
+            },
+            id="roles-table-container"
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("역할 업데이트 실패", role_name=role_name, error=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="역할 업데이트에 실패했습니다",
+        )
+
+
+@app.post("/admin/roles/create", response_class=HTMLResponse)
+async def create_role(
+    request: Request,
+    current_user: Annotated[UserResponse, Depends(require_admin)],
+    rbac_service=Depends(get_rbac_service),
+):
+    """새 역할 생성"""
+    try:
+        form_data = await request.form()
+        role_name = form_data.get("name", "").strip()
+        description = form_data.get("description", "").strip()
+        
+        if not role_name:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="역할 이름은 필수입니다",
+            )
+        
+        if role_name in rbac_service.role_permissions:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="이미 존재하는 역할입니다",
+            )
+        
+        # 새 역할 생성 (기본적으로 빈 권한)
+        rbac_service.role_permissions[role_name] = []
+        
+        logger.info(
+            "새 역할 생성", 
+            role_name=role_name, 
+            description=description,
+            admin_user=current_user.email
+        )
+        
+        # 페이지 새로고침
+        return HTMLResponse(
+            content="",
+            headers={"HX-Refresh": "true"},
+            status_code=200
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("역할 생성 실패", error=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="역할 생성에 실패했습니다",
+        )
 
 
 @app.get("/admin/users/{user_id}/permissions", response_class=HTMLResponse)
@@ -2789,26 +5256,7 @@ async def admin_user_permissions_page(
                 cls="bg-white rounded-lg shadow-md p-6",
             ),
             # JavaScript 함수들
-            Script("""
-                function deletePermission(permissionId) {
-                    if (confirm('정말로 이 권한을 삭제하시겠습니까?')) {
-                        fetch(`/api/v1/permissions/resources/${permissionId}`, {
-                            method: 'DELETE',
-                            headers: {
-                                'Authorization': 'Bearer ' + localStorage.getItem('access_token')
-                            }
-                        })
-                        .then(response => response.json())
-                        .then(data => {
-                            alert('권한이 삭제되었습니다.');
-                            location.reload();
-                        })
-                        .catch(error => {
-                            alert('권한 삭제 중 오류가 발생했습니다.');
-                        });
-                    }
-                }
-            """),
+            # JavaScript 함수 제거됨 - HTMX 엔드포인트로 대체
         )
 
         page = create_layout(f"{user.email} 권한 관리", content, current_user)

@@ -87,6 +87,12 @@ services:
       # Internal Authentication
       MCP_INTERNAL_API_KEY: ${MCP_INTERNAL_API_KEY:-your-internal-api-key-change-in-production}
       
+      # Initial Admin Account
+      AUTO_CREATE_ADMIN: ${AUTO_CREATE_ADMIN:-true}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@example.com}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-Admin123!}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-System Admin}
+      
       # Logging
       LOG_LEVEL: DEBUG
     volumes:
@@ -94,8 +100,6 @@ services:
     ports:
       - "8000:8000"
     depends_on:
-      postgres:
-        condition: service_healthy
       redis:
         condition: service_healthy
     networks:

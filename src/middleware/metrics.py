@@ -91,6 +91,28 @@ class MetricsMiddleware:
         except Exception as e:
             error_occurred = True
             error_details = str(e)
+            
+            # 시스템 오류 SSE 알림 발송 (심각한 오류인 경우만)
+            if not isinstance(e, (KeyError, ValueError, TypeError)):
+                try:
+                    # SSE 알림 발송 함수를 동적으로 import (순환 참조 방지)
+                    from src.auth.server import send_system_error
+                    send_system_error(
+                        error_msg=f"MCP 요청 처리 중 오류: {str(e)}",
+                        error_details={
+                            "method": method,
+                            "tool_name": tool_name,
+                            "user_id": user_id,
+                            "error_type": type(e).__name__
+                        }
+                    )
+                except ImportError:
+                    # SSE 시스템이 없는 경우 무시
+                    pass
+                except Exception:
+                    # SSE 알림 발송 실패는 무시 (메인 오류에 영향 주지 않음)
+                    pass
+            
             raise
 
         finally:

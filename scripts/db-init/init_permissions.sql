@@ -19,7 +19,7 @@ INSERT INTO resource_permissions (role_name, resource_type, resource_name, actio
 
 -- admin은 코드에서 하드코딩된 전체 권한을 가지므로 별도 설정 불필요
 
--- 특정 사용자에게 추가 권한 부여 예시 (주석 처리)
+-- 특정 사용자에게 추가 권한 부여 예시
 -- INSERT INTO resource_permissions (user_id, resource_type, resource_name, actions, granted_by) VALUES
 --     (1, 'vector_db', 'admin.logs', ARRAY['read'], 2),
 --     (1, 'database', 'audit.*', ARRAY['read'], 2);

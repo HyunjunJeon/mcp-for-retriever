@@ -3,7 +3,7 @@ name = "make-mcp-server-vibe"
 version = "0.1.0"
 description = "패스트캠퍼스 2025.07 일할맛세미나 - MCP for Retriever"
 authors = [{"name" = "HyunjunJeon", "email" = "jeonhj920@gmail.com"}]
-license = {text = "MIT"}
+license = { file = "LICENSE" }
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
